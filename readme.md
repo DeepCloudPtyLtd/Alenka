@@ -31,6 +31,9 @@ This is a GPU based database engine written to use vector based processing and h
   * Data skipping  
     Better performance without indexes.	
 
+  * Fast Loading  
+    Gpu based CSV parser loads the data into database at very high speed. 
+
 ### How to use it ?
 
 Create your data files :
@@ -74,5 +77,4 @@ Run your queries from a command prompt or use Alenka [JDBC driver](https://githu
 
 `STORE RES INTO 'results.txt' USING ('|') LIMIT 10;`
 
-[![githalytics.com alpha](https://cruel-carlota.pagodabox.com/924b3b89c15fc603702a40b6ef0a718f "githalytics.com")](http://githalytics.com/antonmks/Alenka)
 

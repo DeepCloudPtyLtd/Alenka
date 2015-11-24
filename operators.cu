@@ -1,7 +1,10 @@
 #include "operators.h"
+#include <thrust/iterator/permutation_iterator.h>
+#include <thrust/set_operations.h>
 
 using namespace mgpu;
 using namespace std;
+using namespace thrust::placeholders;
 
 size_t int_size = sizeof(int_type);
 size_t float_size = sizeof(float_type);
@@ -10,8 +13,6 @@ queue<string> namevars;
 queue<string> typevars;
 queue<int> sizevars;
 queue<int> cols;
-queue<string> references;
-queue<string> references_names;
 
 queue<unsigned int> j_col_count;
 unsigned int sel_count = 0;
@@ -22,6 +23,7 @@ unsigned int join_tab_cnt = 0;
 unsigned int tab_cnt = 0;
 queue<string> op_join;
 queue<char> join_type;
+queue<char> join_eq_type;
 unsigned int partition_count;
 map<string,unsigned int> stat;
 map<unsigned int, unsigned int> join_and_cnt;
@@ -31,7 +33,9 @@ ContextPtr context;
 void* p_tmp1 = nullptr;
 bool set_p = 0;
 int p_sz = 0;
-
+thrust::device_vector<unsigned char> scratch;
+map<string, string> filter_var; 
+thrust::device_vector<int> ranj;
 
 void check_used_vars()
 {
@@ -75,11 +79,11 @@ void emit_fieldname(const char* name1, const char* name2)
     op_value.push(s1 + "." + s2);
 };
 
-
 void emit_number(const int_type val)
 {
     op_type.push("NUMBER");
     op_nums.push(val);
+	op_nums_precision.push(0);
 }
 
 void emit_float(const float_type val)
@@ -88,13 +92,22 @@ void emit_float(const float_type val)
     op_nums_f.push(val);
 }
 
-void emit_decimal(const float_type val)
+void emit_decimal(const char* str)
 {
-    op_type.push("DECIMAL");
-    op_nums_f.push(val);
+    op_type.push("NUMBER");
+    string s1(str);
+	unsigned int precision;
+	auto pos = s1.find(".");
+	if(pos == std::string::npos)
+		precision = 0;
+	else {
+		precision = (s1.length() - pos) -1;
+		s1.erase(pos,1);
+	};	
+	op_nums.push(stoi(s1));
+    op_nums_precision.push(precision);
+	//cout << "Decimal " << stoi(s1) << " " << precision << endl; 
 }
-
-
 
 void emit_mul()
 {
@@ -122,6 +135,7 @@ void emit_and()
 void emit_eq()
 {
     op_type.push("JOIN");
+	join_eq_type.push('E');
     if(misses == 0) {
         join_and_cnt[tab_cnt] = join_col_cnt;
         misses = join_col_cnt;
@@ -133,11 +147,33 @@ void emit_eq()
     }
 }
 
+void emit_neq()
+{
+    op_type.push("JOIN");
+	join_eq_type.push('N');
+    if(misses == 0) {
+        join_and_cnt[tab_cnt] = join_col_cnt;
+        misses = join_col_cnt;
+        join_col_cnt = 0;
+        tab_cnt++;
+    }
+    else {
+        misses--;
+    }
+}
+
+
 void emit_distinct()
 {
     op_type.push("DISTINCT");
     distinct_cnt++;
 }
+
+void emit_year()
+{
+    op_type.push("YEAR");
+}
+
 
 void emit_or()
 {
@@ -166,8 +202,6 @@ void emit_var(const char *s, const int c, const char *f, const char* ref, const 
     typevars.push(f);
     sizevars.push(0);
     cols.push(c);
-    references.push(ref);
-    references_names.push(ref_name);
 }
 
 void emit_var_asc(const char *s)
@@ -200,8 +234,14 @@ void emit_varchar(const char *s, const int c, const char *f, const int d, const 
     typevars.push(f);
     sizevars.push(d);
     cols.push(c);
-    references.push(ref);
-    references_names.push(ref_name);
+}
+
+void emit_vardecimal(const char *s, const int c, const char *f, const int scale, const int precision)
+{
+    namevars.push(s);
+    typevars.push(f);
+    sizevars.push(precision);
+    cols.push(c);	
 }
 
 void emit_sel_name(const char *s)
@@ -245,32 +285,81 @@ void emit_join_tab(const char *s, const char tp)
 };
 
 
+void order_inplace_host(CudaSet* a, stack<string> exe_type, set<string> field_names,  bool update_str)
+{
+    unsigned int* permutation = new unsigned int[a->mRecCount];
+    thrust::sequence(permutation, permutation + a->mRecCount);
+
+    char* temp = new char[a->mRecCount*max_char(a)];
+    stack<string> exe_type1(exe_type), exe_value;
+
+    while(!exe_type1.empty()) {
+        exe_value.push("ASC");
+        exe_type1.pop();
+    };
+
+    // sort on host
+
+    for(;!exe_type.empty(); exe_type.pop(),exe_value.pop()) {
+        if (a->type[exe_type.top()] != 1)
+            update_permutation_host(a->h_columns_int[exe_type.top()].data(), permutation, a->mRecCount, exe_value.top(), (int_type*)temp);
+        else 
+            update_permutation_host(a->h_columns_float[exe_type.top()].data(), permutation, a->mRecCount,exe_value.top(), (float_type*)temp);
+    };
+
+	for (auto it=field_names.begin(); it!=field_names.end(); ++it) {
+        if (a->type[*it] != 1) {
+            thrust::gather(permutation, permutation + a->mRecCount, a->h_columns_int[*it].data(), (int_type*)temp);
+            thrust::copy((int_type*)temp, (int_type*)temp + a->mRecCount, a->h_columns_int[*it].data());
+        }
+        else  {
+            thrust::gather(permutation, permutation + a->mRecCount, a->h_columns_float[*it].data(), (float_type*)temp);
+            thrust::copy((float_type*)temp, (float_type*)temp + a->mRecCount, a->h_columns_float[*it].data());
+        }
+    };
+
+    delete [] temp;
+    delete [] permutation;
+}
+
 
 void order_inplace(CudaSet* a, stack<string> exe_type, set<string> field_names, bool update_str)
 {
-    thrust::device_ptr<unsigned int> permutation = thrust::device_malloc<unsigned int>(a->mRecCount);
+	if(scratch.size() < a->mRecCount*4)
+		scratch.resize(a->mRecCount*4);
+	thrust::device_ptr<unsigned int> permutation((unsigned int*)thrust::raw_pointer_cast(scratch.data()));	
     thrust::sequence(permutation, permutation+a->mRecCount,0,1);
-
     unsigned int* raw_ptr = thrust::raw_pointer_cast(permutation);
-    void* temp;
-    CUDA_SAFE_CALL(cudaMalloc((void **) &temp, a->mRecCount*int_size));
-
-    for(; !exe_type.empty(); exe_type.pop()) {
+	
+	if(a->grp.size() < a->mRecCount*8)
+		a->grp.resize(a->mRecCount*8);
+ 	unsigned int bits;
+	
+    for(; !exe_type.empty(); exe_type.pop()) {	
+		if(cpy_bits.empty())
+			bits = 0;
+		else	
+			bits = cpy_bits[exe_type.top()];			
         if (a->type[exe_type.top()] != 1)
-            update_permutation(a->d_columns_int[exe_type.top()], raw_ptr, a->mRecCount, "ASC", (int_type*)temp);
+            update_permutation(a->d_columns_int[exe_type.top()], raw_ptr, a->mRecCount, "ASC", (int_type*)thrust::raw_pointer_cast(a->grp.data()), bits);
         else
-            update_permutation(a->d_columns_float[exe_type.top()], raw_ptr, a->mRecCount,"ASC", (float_type*)temp);
-    };
+            update_permutation(a->d_columns_float[exe_type.top()], raw_ptr, a->mRecCount,"ASC", (float_type*)thrust::raw_pointer_cast(a->grp.data()), bits);			
+    };	
+	
 
     for (auto it=field_names.begin(); it!=field_names.end(); ++it) {
+		if(cpy_bits.empty())
+			bits = 0;
+		else	
+			bits = cpy_bits[*it];
+			
         if (a->type[*it] != 1) {
-            apply_permutation(a->d_columns_int[*it], raw_ptr, a->mRecCount, (int_type*)temp);
+            apply_permutation(a->d_columns_int[*it], raw_ptr, a->mRecCount, (int_type*)thrust::raw_pointer_cast(a->grp.data()), bits);		
         }
-        else
-            apply_permutation(a->d_columns_float[*it], raw_ptr, a->mRecCount, (float_type*)temp);
+        else {
+            apply_permutation(a->d_columns_float[*it], raw_ptr, a->mRecCount, (float_type*)thrust::raw_pointer_cast(a->grp.data()), bits);			
+		};				
     };
-    cudaFree(temp);
-    thrust::device_free(permutation);
 }
 
 bool check_star_join(const string j1)
@@ -323,7 +412,7 @@ void star_join(const char *s, const string j1)
         op_value.pop();
     };
     auto op_sel_s(op_sel), op_sel_s_as(op_sel_as), op_g(op_value);
-    CudaSet* c = new CudaSet(op_sel_s, op_sel_s_as, op_join);
+    CudaSet* c = new CudaSet(op_sel_s, op_sel_s_as);
 
     string f1, f2;
     map<string, string> key_map;
@@ -352,16 +441,13 @@ void star_join(const char *s, const string j1)
             op_vd.pop();
         };
 
-        //tab_map[op_jj.front()] = i;
         key_map[op_jj.front()] = f1;
-        //cout << "Set " << op_jj.front() << " to " << f1 << endl;
 
         CudaSet* right = varNames.find(op_jj.front())->second;
         if(!check_bitmaps_exist(left, right)) {
             cout << "Required bitmap on table " << op_jj.front() << " doesn't exists" << endl;
             exit(0);
         };
-        //cout << "table " << op_jj.front() << " " << f2 << endl;
 
         queue<string> second;
         while(!op_alt.empty()) {
@@ -412,7 +498,7 @@ void star_join(const char *s, const string j1)
         size_t cnt_c = 0;
         allocColumns(left, left->fil_value);
         copyColumns(left, left->fil_value, i, cnt_c);
-        bool* res = filter(left->fil_type, left->fil_value, left->fil_nums, left->fil_nums_f, left, i);
+        bool* res = filter(left->fil_type, left->fil_value, left->fil_nums, left->fil_nums_f, left->fil_nums_precision, left, i);
         thrust::device_ptr<bool> star((bool*)res);
         size_t cnt = thrust::count(star, star + (unsigned int)left->mRecCount, 1);
         cout << "join res " << cnt << " out of " << left->mRecCount << endl;
@@ -436,6 +522,7 @@ void star_join(const char *s, const string j1)
             queue<string> op_sel1(op_sel_s);
             void* temp;
             CUDA_SAFE_CALL(cudaMalloc((void **) &temp, cnt*max_char(c)));
+			cudaMemset(temp,0,cnt*max_char(c));
             CudaSet *t;
             unsigned int cnt1, bits;
             int_type lower_val;
@@ -460,7 +547,7 @@ void star_join(const char *s, const string j1)
                             //std::cout<<  "SSD L SEEK READ " <<  ( ( std::clock() - start1 ) / (double)CLOCKS_PER_SEC ) << endl;
                         }
                         else {
-                            t->readSegmentsFromFile(i, op_sel1.front(), 0);
+                            t->readSegmentsFromFile(i, op_sel1.front());
                             void* h;
 
                             if(!interactive) {
@@ -473,7 +560,7 @@ void star_join(const char *s, const string j1)
                                 string ff = t->load_file_name + "." + op_sel1.front()+ "." + to_string(i);
                                 h = buffers[ff];
                             };
-                            cnt1 = ((unsigned int*)h)[0];
+                            cnt1 = ((unsigned int*)h)[0];//bytes
                             lower_val = ((int_type*)(((unsigned int*)h)+1))[0];
                             bits = ((unsigned int*)((char*)h + cnt1))[8];
                             //cout << cnt1 << " " << lower_val << " " << bits << " " << left->type[op_sel1.front()] << endl;
@@ -556,7 +643,7 @@ void star_join(const char *s, const string j1)
                                 //std::cout<<  "SSD R SEEK READ " <<  ( ( std::clock() - start1 ) / (double)CLOCKS_PER_SEC ) << endl;
                             }
                             else {
-                                t->readSegmentsFromFile(i, key_map[it->first], 0);
+                                t->readSegmentsFromFile(i, key_map[it->first]);
                                 void* h;
                                 if(!interactive) {
                                     h = t->h_columns_int[key_map[it->first]].data();
@@ -610,13 +697,11 @@ void star_join(const char *s, const string j1)
 
                             if(r->type[op_sel1.front()] != 1) {
                                 thrust::device_ptr<int_type> d_tmp((int_type*)temp);
-                                thrust::sequence(d_tmp, d_tmp+cnt,0,0);
                                 thrust::gather(prm_tmp_d.begin(), prm_tmp_d.end(), r->d_columns_int[op_sel1.front()].begin(), d_tmp);
                                 thrust::copy(d_tmp, d_tmp + cnt, c->h_columns_int[op_sel1.front()].begin() + offset);
                             }
                             else {
                                 thrust::device_ptr<float_type> d_tmp((float_type*)temp);
-                                thrust::sequence(d_tmp, d_tmp+cnt,0,0);
                                 thrust::gather(prm_tmp_d.begin(), prm_tmp_d.end(), r->d_columns_float[op_sel1.front()].begin(), d_tmp);
                                 thrust::copy(d_tmp, d_tmp + cnt, c->h_columns_float[op_sel1.front()].begin() + offset);
                             };
@@ -650,9 +735,7 @@ void star_join(const char *s, const string j1)
             };
             idx.pop();
         };
-
     };
-
 
     //if(verbose)
     //    std::cout<< "star join time " <<  ( ( std::clock() - start1 ) / (double)CLOCKS_PER_SEC ) << " " << getFreeMem() << endl;
@@ -668,12 +751,7 @@ void star_join(const char *s, const string j1)
 
     if(verbose)
         cout << endl << "join count " << c->mRecCount << endl;
-
-
 };
-
-
-
 
 
 void emit_join(const char *s, const char *j1, const int grp, const int start_seg, const int end_seg)
@@ -689,10 +767,16 @@ void emit_join(const char *s, const char *j1, const int grp, const int start_seg
         };
         stat[s] = statement_count;
         stat[j1] = statement_count;
+		if(filter_var.find(j1) != filter_var.end()) {
+			stat[filter_var[j1]] = statement_count;
+		};
         check_used_vars();
         while(!op_join.empty()) {
             stat[op_join.front()] = statement_count;
-            op_join.pop();
+			if(filter_var.find(op_join.front()) != filter_var.end()) {
+				stat[filter_var[op_join.front()]] = statement_count;
+			};			
+            op_join.pop();			
         };
         return;
     };
@@ -801,8 +885,16 @@ void emit_join(const char *s, const char *j1, const int grp, const int start_seg
             varNames.erase(op_join.front());
         };
     };
-
 }
+
+template<typename T, typename P>
+void p_gather(thrust::host_vector<int>& h_tmp, T* h, P* dest)
+{
+	for(int i = 0; i < h_tmp.size(); i++) {
+		dest[i] = h[h_tmp[i]];
+	};	
+};	
+
 
 
 void emit_multijoin(const string s, const string j1, const string j2, const unsigned int tab, const char* res_name, const int start_segment, const int end_segment)
@@ -850,13 +942,10 @@ void emit_multijoin(const string s, const string j1, const string j2, const unsi
     op_g.pop();
 
     if (verbose)
-        cout << "JOIN " << s <<  " " <<  f1 << " " << f2 << " " << getFreeMem() <<  endl;
+        cout << "JOIN " << s <<  " " <<  f1 << " " << f2 << " " << getFreeMem() <<  " " << phase_copy << endl;
 
     std::clock_t start1 = std::clock();
     CudaSet* c = new CudaSet(right, left, op_sel_s, op_sel_s_as);
-    left->cpy_strings = 0;
-    right->cpy_strings = 0;
-    c->cpy_strings = 0;
 
     if ((left->mRecCount == 0 && !left->filtered) || (right->mRecCount == 0 && !right->filtered)) {
         c = new CudaSet(left, right, op_sel_s, op_sel_s_as);
@@ -904,13 +993,14 @@ void emit_multijoin(const string s, const string j1, const string j2, const unsi
     };
 
 
-    bool decimal_join = 0;
-    if (left->type[colname1] == 1 && right->type[colname2]  == 1)
-        decimal_join = 1;
+    //bool decimal_join = 0;
+    //if (left->type[colname1] == 1 && right->type[colname2]  == 1)
+    //    decimal_join = 1;
 
     queue<string> op_vd(op_g);
     queue<string> op_g1(op_g);
     queue<string> op_alt(op_sel);
+	
     unsigned int jc = join_and_cnt[join_tab_cnt - tab];
     while(jc) {
         jc--;
@@ -935,8 +1025,7 @@ void emit_multijoin(const string s, const string j1, const string j2, const unsi
     size_t cnt_l, res_count, tot_count = 0, offset = 0, k = 0;
     queue<string> lc(cc);
     thrust::device_vector<unsigned int> v_l(left->maxRecs);
-    MGPU_MEM(int) aIndicesDevice, bIndicesDevice;
-    std::vector<int> j_data;
+    MGPU_MEM(int) aIndicesDevice, bIndicesDevice, intersectionDevice;
 
     stack<string> exe_type;
     set<string> field_names;
@@ -947,51 +1036,36 @@ void emit_multijoin(const string s, const string j1, const string j2, const unsi
         };
     };
 
-    thrust::device_vector<int> p_tmp;
-    //to keep track of sources of each segment : <source_name, segment>
-    vector<size_t> border_boundaries;
-    vector< map<string, set<unsigned int> > > border_segments;
+    thrust::device_vector<int> p_tmp;    
     unsigned int start_part = 0;
-    size_t r_size = right->columnNames.size()*right->hostRecCount*8;
-    map<string, set<unsigned int> > r_segs;
-    left->cpy_strings = 0;
-    right->cpy_strings = 0;
+	bool prejoin = 0;
 
     while(start_part < right->segCount) {
 
-        bool rsz = 1;
         right->deAllocOnDevice();
-
-        if(right->not_compressed || (!right->filtered && getFreeMem() < r_size*2)) {
-            //cout << "load by segment " << endl;
-            cnt_r = load_right(right, colname2, f2, op_g1, op_sel, op_alt, decimal_join, rcount, start_part, start_part+1, rsz);
-            start_part = start_part+1;
-
-            for(auto it = right->orig_segs[start_part-1].begin(); it != right->orig_segs[start_part-1].end(); it++) {
-                for(auto itr = it->second.begin(); itr != it->second.end(); itr++) {
-                    r_segs[it->first].insert(*itr);
-                };
-            };
+		std::clock_t start12 = std::clock();
+        if(right->not_compressed || (!right->filtered && getFreeMem() < right->columnNames.size()*right->hostRecCount*8*2)) {
+            cnt_r = load_right(right, f2, op_g1, op_alt, rcount, start_part, start_part+1);
+            start_part = start_part+1;			
         }
         else {
-            //cout << "load all segments " << endl;
-            cnt_r = load_right(right, colname2, f2, op_g1, op_sel, op_alt, decimal_join, rcount, start_part, right->segCount, rsz);
-            //cout << "loaded all segs " << endl;
+            cnt_r = load_right(right, f2, op_g1, op_alt, rcount, start_part, right->segCount);			
             start_part = right->segCount;
-
-            for(auto& m : right->orig_segs) {
-                for(auto it = m.begin(); it != m.end(); it++) {
-                    for(auto itr = it->second.begin(); itr != it->second.end(); itr++) {
-                        r_segs[it->first].insert(*itr);
-                    };
-                };
-            };
+			
+			for(unsigned int i=0; i < right->columnNames.size(); i++) {
+				if (right->type[right->columnNames[i]] != 1) {
+					right->d_columns_int[right->columnNames[i]].shrink_to_fit();
+				}
+				else 
+					right->d_columns_float[right->columnNames[i]].shrink_to_fit();
+			};    			
         };
 
         right->mRecCount = cnt_r;
         bool order = 1;
-
-        if(!right->sorted_fields.empty() && right->sorted_fields.front() == f2) {
+		
+		
+        if(!right->presorted_fields.empty() && right->presorted_fields.front() == f2) {
             order = 0;
             //cout << "No need to sort " << endl;
             if (right->d_columns_int[f2][0] == 1 && right->d_columns_int[f2][right->d_columns_int[f2].size()-1] == right->d_columns_int[f2].size())
@@ -1000,7 +1074,7 @@ void emit_multijoin(const string s, const string j1, const string j2, const unsi
                 right->sort_check = '0';
             };
         };
-
+		
         if(order) {
             if(thrust::is_sorted(right->d_columns_int[f2].begin(), right->d_columns_int[f2].end())) {
                 if (right->d_columns_int[f2][0] == 1 && right->d_columns_int[f2][right->d_columns_int[f2].size()-1] == right->d_columns_int[f2].size()) {
@@ -1009,14 +1083,42 @@ void emit_multijoin(const string s, const string j1, const string j2, const unsi
                 else {
                     right->sort_check = '0';
                 };
-                //cout << f2 << " already sorted " << endl;
             }
             else {
-                order_inplace(right, exe_type, field_names, 0);
+				//cout << "sorting " << endl;
+				size_t tot_size = right->mRecCount*8*right->columnNames.size();
+				if (getFreeMem() > tot_size*1.5) {
+					order_inplace(right, exe_type, field_names, 0);					
+				}
+				else {
+   				    //for(unsigned int i = 0; i < right->columnNames.size(); i++) {
+					for (auto it=field_names.begin(); it!=field_names.end(); ++it) {
+						//cout << "sorting " << *it << endl;
+						if(right->type[*it] != 1) {
+							if(right->h_columns_int[*it].size() < right->mRecCount)
+								right->h_columns_int[*it].resize(right->mRecCount);
+							thrust::copy(right->d_columns_int[*it].begin(), right->d_columns_int[*it].begin() +	right->mRecCount, right->h_columns_int[*it].begin());			
+						}	
+						else {
+							if(right->type[*it] == 1) {						
+								if(right->h_columns_float[*it].size() < right->mRecCount)
+									right->h_columns_float[*it].resize(right->mRecCount);
+							};		
+							thrust::copy(right->d_columns_float[*it].begin(), right->d_columns_float[*it].begin() +	right->mRecCount, right->h_columns_float[*it].begin());			
+						};		
+					};	
+					order_inplace_host(right, exe_type, field_names, 0);
+				    for (auto it=field_names.begin(); it!=field_names.end(); ++it) {
+						if(right->type[*it] != 1) 
+							thrust::copy(right->h_columns_int[*it].begin(), right->h_columns_int[*it].begin() + right->mRecCount, right->d_columns_int[*it].begin());
+						else	
+							thrust::copy(right->h_columns_float[*it].begin(), right->h_columns_float[*it].begin() + right->mRecCount, right->d_columns_float[*it].begin());
+					};
+				};		
             };
         };
 
-        //cout << right->sort_check << " " << getFreeMem() << endl;
+	//std::cout<< "join right load time " <<  ( ( std::clock() - start12 ) / (double)CLOCKS_PER_SEC ) <<  " " << getFreeMem() << '\n';				
 
         int e_segment;
         if(end_segment == -1) {
@@ -1026,42 +1128,19 @@ void emit_multijoin(const string s, const string j1, const string j2, const unsi
             e_segment = end_segment;
 
         for (unsigned int i = start_segment; i < e_segment; i++) {
-
+		
             if(verbose)
                 //cout << "segment " << i <<  '\xd';
                 cout << "segment " << i <<  endl;
-            j_data.clear();
-
-            //for (set<unsigned int>::iterator it = left->ref_joins[colInd1][i].begin(); it != left->ref_joins[colInd1][i].end(); it++) {
-            //	cout << "seg match " << *it << endl;
-            //};
-
-            //for (set<unsigned int>::iterator it = right->orig_segs[left->ref_sets[colInd1]].begin(); it != right->orig_segs[left->ref_sets[colInd1]].end(); it++) {
-            //	cout << "right segs " << *it << endl;
-            //};
-
-            if(!left->ref_joins.empty() && !right->orig_segs.empty()) {
-                if(left->ref_joins[colname1][i].size() && r_segs[left->ref_sets[colname1]].size()) {
-                    set_intersection(left->ref_joins[colname1][i].begin(),left->ref_joins[colname1][i].end(),
-                                     r_segs[left->ref_sets[colname1]].begin(), r_segs[left->ref_sets[colname1]].end(),
-                                     std::back_inserter(j_data));
-                    //for(auto it = right->orig_segs[start_part-1][left->ref_sets[colname1]].begin(); it != right->orig_segs[start_part-1][left->ref_sets[colname1]].end(); it++)
-                    //cout << "Checking right " << 	left->ref_sets[colname1] << " " << *it << endl;
-
-                    if(j_data.empty()) {
-                        cout << "skipping a segment " << endl;
-                        continue;
-                    };
-                };
-            };
-
             cnt_l = 0;
-            copyColumns(left, lc, i, cnt_l);
+            copyColumns(left, lc, i, cnt_l);	
             cnt_l = left->mRecCount;
+			auto join_eq_type1(join_eq_type);
 
-            if (cnt_l) {
-                // sort the left index column, save the permutation vector, it might be needed later
-
+            if (cnt_l) {							
+				
+		
+                // sort the left index column, save the permutation vector, it might be needed later				
                 thrust::device_ptr<int_type> d_col((int_type*)thrust::raw_pointer_cast(left->d_columns_int[colname1].data()));
                 thrust::sequence(v_l.begin(), v_l.begin() + cnt_l,0,1);
 
@@ -1077,14 +1156,32 @@ void emit_multijoin(const string s, const string j1, const string j2, const unsi
                     };
                 };
 
-                if(do_sort)
+                if(do_sort) {
                     thrust::sort_by_key(d_col, d_col + cnt_l, v_l.begin());
+				}	
                 else if(verbose)
                     cout << "No need of sorting " << endl;
+				
+				if(prejoin) {
+					res_count = SetOpKeys<MgpuSetOpIntersection, true>(thrust::raw_pointer_cast(left->d_columns_int[colname1].data()), cnt_l,
+															thrust::raw_pointer_cast(right->d_columns_int[colname2].data()), cnt_r,
+															&intersectionDevice, *context, false);	
+					if(!res_count)
+						continue;     
+				};		
+				
                 if(verbose)
-                    cout << "join " << cnt_l << ":" << cnt_r << " " << join_type.front() << endl;
-                //cout << "SZ " << left->d_columns_int[colname1].size() << endl;
+                    cout << "join " << cnt_l << ":" << cnt_r << " " << join_type.front() <<  endl;
+					
+				/*if(cnt_r > 10) {
+                    for(int z = 0; z < 10 ; z++)
+                    	cout << " R " << right->d_columns_int[colname2][(cnt_r-1)-z] << endl;
 
+                    for(int z = 0; z < 10 ; z++)
+                    	cout << " L " << left->d_columns_int[colname1][(cnt_l-1)-z] << endl;
+                };
+				*/
+				
 
                 if (left->d_columns_int[colname1][0] > right->d_columns_int[colname2][cnt_r-1] ||
                         left->d_columns_int[colname1][cnt_l-1] < right->d_columns_int[colname2][0]) {
@@ -1098,21 +1195,13 @@ void emit_multijoin(const string s, const string j1, const string j2, const unsi
                 //cout << "joining " << left->d_columns_int[colname1][0] << " : " << left->d_columns_int[colname1][cnt_l-1] << " and " << right->d_columns_int[colname2][0] << " : " << right->d_columns_int[colname2][cnt_r-1] << endl;
 
                 char join_kind = join_type.front();
-
-                /*	if(cnt_r > 10) {
-                    for(int z = 0; z < 10 ; z++)
-                    	cout << " R " << right->d_columns_int[colname2][z] << endl;
-
-                    for(int z = 0; z < 10 ; z++)
-                    	cout << " L " << left->d_columns_int[colname1][z] << endl;
-                	};
-                */
-
-                if (join_kind == 'I')
+				std::clock_t start11 = std::clock();
+				
+                if (join_kind == 'I' || join_kind == '1' || join_kind == '2' || join_kind == '3' || join_kind == '4')
                     res_count = RelationalJoin<MgpuJoinKindInner>(thrust::raw_pointer_cast(left->d_columns_int[colname1].data()), cnt_l,
                                 thrust::raw_pointer_cast(right->d_columns_int[colname2].data()), cnt_r,
                                 &aIndicesDevice, &bIndicesDevice,
-                                mgpu::less<int_type>(), *context);
+                                mgpu::less<int_type>(), *context);								
                 else if(join_kind == 'L')
                     res_count = RelationalJoin<MgpuJoinKindLeft>(thrust::raw_pointer_cast(left->d_columns_int[colname1].data()), cnt_l,
                                 thrust::raw_pointer_cast(right->d_columns_int[colname2].data()), cnt_r,
@@ -1128,27 +1217,32 @@ void emit_multijoin(const string s, const string j1, const string j2, const unsi
                                 thrust::raw_pointer_cast(right->d_columns_int[colname2].data()), cnt_r,
                                 &aIndicesDevice, &bIndicesDevice,
                                 mgpu::less<int_type>(), *context);
+				
+				if(verbose)	
+					std::cout<< "join time " <<  ( ( std::clock() - start11 ) / (double)CLOCKS_PER_SEC ) <<  '\n';				
 
                 if(verbose)
-                    cout << "RES " << res_count << " seg " << getFreeMem() << endl;
-
+                    cout << "RES " << res_count << endl;
+				if(res_count == 0)
+					prejoin = 1; 				
+				
+				
                 int* r1 = aIndicesDevice->get();
                 thrust::device_ptr<int> d_res1((int*)r1);
                 int* r2 = bIndicesDevice->get();
                 thrust::device_ptr<int> d_res2((int*)r2);
-
+				
                 if(res_count) {
                     p_tmp.resize(res_count);
                     thrust::sequence(p_tmp.begin(), p_tmp.end(),-1);
-                    thrust::gather_if(d_res1, d_res1+res_count, d_res1, v_l.begin(), p_tmp.begin(), is_positive<int>());
-                };
-
+                    thrust::gather_if(d_res1, d_res1+res_count, d_res1, v_l.begin(), p_tmp.begin(), _1 >= 0);					
+                };				
+				
 
                 // check if the join is a multicolumn join
                 unsigned int mul_cnt = join_and_cnt[join_tab_cnt - tab];
-
                 while(mul_cnt) {
-
+					
                     mul_cnt--;
                     queue<string> mult(op_g);
                     string f3 = mult.front();
@@ -1156,98 +1250,124 @@ void emit_multijoin(const string s, const string j1, const string j2, const unsi
                     string f4 = mult.front();
                     mult.pop();
 
-                    //cout << "ADDITIONAL COL JOIN " << f3 << " " << f4 << " " << getFreeMem() << endl;
+                    //cout << "ADDITIONAL COL JOIN " << f3 << " " << f4 << " " << join_eq_type.front() << endl;
 
                     queue<string> rc;
                     rc.push(f3);
-
+					
                     allocColumns(left, rc);
                     size_t offset = 0;
                     copyColumns(left, rc, i, offset, 0, 0);
                     rc.pop();
 
-                    void* temp;
-                    CUDA_SAFE_CALL(cudaMalloc((void **) &temp, res_count*float_size));
-                    void* temp1;
-                    CUDA_SAFE_CALL(cudaMalloc((void **) &temp1, res_count*float_size));
-                    cudaMemset(temp,0,res_count*float_size);
-                    cudaMemset(temp1,0,res_count*float_size);
-
                     if (res_count) {
                         thrust::device_ptr<bool> d_add = thrust::device_malloc<bool>(res_count);
+						
+						if(right->d_columns_int[f4].size() == 0)
+							load_queue(rc, right, f4, rcount, 0, right->segCount, 0, 0);                   
 
-                        if (left->type[f3] == 1 && right->type[f4]  == 1) {
 
-                            if(right->d_columns_float[f4].size() == 0)
-                                load_queue(rc, right, f4, rcount, 0, right->segCount, 0, 0);
-
-                            thrust::device_ptr<float_type> d_tmp((float_type*)temp);
-                            thrust::device_ptr<float_type> d_tmp1((float_type*)temp1);
-                            thrust::gather_if(p_tmp.begin(), p_tmp.end(), p_tmp.begin(), left->d_columns_float[f3].begin(), d_tmp, is_positive<int>());
-                            thrust::gather_if(d_res2, d_res2+res_count, d_res2, right->d_columns_float[f4].begin(), d_tmp1, is_positive<int>());
-                            thrust::transform(d_tmp, d_tmp+res_count, d_tmp1, d_add, float_equal_to());
+                        if (left->type[f3] == 1 && right->type[f4]  == 1) {                        	
+							thrust::transform(make_permutation_iterator(left->d_columns_float[f3].begin(), p_tmp.begin()),
+											  make_permutation_iterator(left->d_columns_float[f3].begin(), p_tmp.end()),
+											  make_permutation_iterator(right->d_columns_float[f4].begin(), d_res2),
+											  d_add, float_equal_to());
                         }
-                        else {
-                            if(right->d_columns_int[f4].size() == 0) {
-                                load_queue(rc, right, f4, rcount, 0, right->segCount, 0, 0);
-                            };
-
-                            thrust::device_ptr<int_type> d_tmp((int_type*)temp);
-                            thrust::device_ptr<int_type> d_tmp1((int_type*)temp1);
-                            thrust::gather_if(p_tmp.begin(), p_tmp.end(), p_tmp.begin(), left->d_columns_int[f3].begin(), d_tmp, is_positive<int>());
-                            thrust::gather_if(d_res2, d_res2+res_count, d_res2, right->d_columns_int[f4].begin(), d_tmp1, is_positive<int>());
-                            thrust::transform(d_tmp, d_tmp+res_count, d_tmp1, d_add, thrust::equal_to<int_type>());
+                        else {                        	
+							if(join_eq_type1.front() != 'N') 
+								thrust::transform(make_permutation_iterator(left->d_columns_int[f3].begin(), p_tmp.begin()),
+												  make_permutation_iterator(left->d_columns_int[f3].begin(), p_tmp.end()),
+												  make_permutation_iterator(right->d_columns_int[f4].begin(), d_res2),
+												  d_add, thrust::equal_to<int_type>());
+							else  {
+								thrust::transform(make_permutation_iterator(left->d_columns_int[f3].begin(), p_tmp.begin()),
+												  make_permutation_iterator(left->d_columns_int[f3].begin(), p_tmp.end()),
+												  make_permutation_iterator(right->d_columns_int[f4].begin(), d_res2),
+												  d_add, thrust::not_equal_to<int_type>());								
+							};				  
                         };
 
-                        if (join_kind == 'I') {  // result count changes only in case of an inner join
+						if (join_kind == 'I' || join_kind == '1' || join_kind == '2' || join_kind == '3' || join_kind == '4') {  // result count changes only in case of an inner join
                             unsigned int new_cnt = thrust::count(d_add, d_add+res_count, 1);
                             thrust::stable_partition(d_res2, d_res2 + res_count, d_add, thrust::identity<unsigned int>());
-                            thrust::stable_partition(p_tmp.begin(), p_tmp.end(), d_add, thrust::identity<unsigned int>());
-                            thrust::device_free(d_add);
+                            thrust::stable_partition(p_tmp.begin(), p_tmp.end(), d_add, thrust::identity<unsigned int>());                            
                             res_count = new_cnt;
-                        }
-                        else { //otherwise we consider it a valid left join result with non-nulls on the left side and nulls on the right side
-                            thrust::transform(d_res2, d_res2 + res_count, d_add , d_res2, set_minus());
-                        };
-                    };
-                    cudaFree(temp);
-                    cudaFree(temp1);
+						}
+						else { //otherwise we consider it a valid left join result with non-nulls on the left side and nulls on the right side
+							thrust::transform(d_res2, d_res2 + res_count, d_add , d_res2, set_minus());
+						};
+						thrust::device_free(d_add);
+					};
+					if(!join_eq_type1.empty())
+						join_eq_type1.pop();
                 };
+				
+				
+				while(!join_eq_type1.empty())
+					join_eq_type1.pop();
+				
+				//cout << "MUL res_count " << res_count << endl;			
+				
+				
+				if(join_kind == '1') { //LEFT SEMI
+					thrust::sort(p_tmp.begin(), p_tmp.begin() + res_count);
+					auto new_end = thrust::unique(p_tmp.begin(), p_tmp.begin() + res_count);
+					res_count = new_end - p_tmp.begin();
+				}
+				else if(join_kind == '2'){ // RIGHT SEMI
+					thrust::sort(d_res2, d_res2 + res_count);
+					auto new_end = thrust::unique(d_res2, d_res2 + res_count);
+					res_count = new_end - d_res2;
+					auto old_sz = ranj.size();
+					ranj.resize(ranj.size() + res_count);
+					thrust::copy(d_res2, d_res2 + res_count, ranj.begin() + old_sz);
+					thrust::sort(ranj.begin(), ranj.end());
+					auto ra_cnt = thrust::unique(ranj.begin(), ranj.end());
+					ranj.resize(ra_cnt-ranj.begin());						
+				}
+				else if(join_kind == '3'){ // ANTI JOIN LEFT
+					thrust::counting_iterator<int> iter(0);
+					thrust::device_vector<int> rr(cnt_l);					
+					auto new_end = thrust::set_difference(iter, iter+cnt_l, p_tmp.begin(), p_tmp.begin() + res_count, rr.begin());
+					res_count = new_end - rr.begin();
+					thrust::copy(rr.begin(), new_end, p_tmp.begin());
+				}
+				else if(join_kind == '4'){ // ANTI JOIN RIGHT
+	
+					thrust::sort(d_res2, d_res2 + res_count);			
+					auto new_end = thrust::unique(d_res2, d_res2 + res_count);			
+					auto cnt = new_end - d_res2;
+					thrust::device_vector<int> seq(cnt + ranj.size());		
+					
+					//auto new_end = thrust::set_difference(seq.begin(), seq.end(), d_res2, d_res2 + res_count, rr.begin());
+					auto new_end1 = thrust::set_union(d_res2, d_res2 + cnt, ranj.begin(), ranj.end(), seq.begin());					
+					auto s_cnt = new_end1 - seq.begin();
+					thrust::sort(seq.begin(), seq.begin() + s_cnt);
+					auto end_seq = thrust::unique(seq.begin(), seq.begin() + s_cnt);
+					auto u_cnt = end_seq - seq.begin();					
+					ranj.resize(u_cnt);
+					thrust::copy(seq.begin(), seq.begin() + u_cnt, ranj.begin());
+					
+					thrust::sort(ranj.begin(), ranj.end());
+					auto ra_cnt = thrust::unique(ranj.begin(), ranj.end());
+					ranj.resize(ra_cnt-ranj.begin());								
+				}
+				
 
                 tot_count = tot_count + res_count;
+				//cout << "tot " << tot_count << endl;
 
-                if(res_count) {
-
-                    border_boundaries.push_back(res_count);
-                    map<string, set<unsigned int> > m;
-
-                    if(!left->orig_segs.empty() && !right->orig_segs.empty()) {
-                        for (auto itr = left->orig_segs[i].begin(); itr != left->orig_segs[i].end(); itr++) {
-                            for (auto it = itr->second.begin(); it != itr->second.end(); it++) {
-                                //cout << "LEFT SEGS " << itr->first << " : " << *it << endl;
-                                m[itr->first].insert(*it);
-                            };
-                        };
-
-                        for (auto it = r_segs.begin(); it != r_segs.end(); it++) {
-                            for (auto itr = it->second.begin(); itr != it->second.end(); itr++) {
-                                //cout << "RIGHT SEGS " << it->first << " : " << *itr << endl;
-                                m[it->first].insert(*itr);
-                            };
-                        };
-                        border_segments.push_back(m);
-                    };
-
+				//std::clock_t start12 = std::clock();
+                if(res_count && join_kind != '4' && join_kind != '2') {          		
+					
                     offset = c->mRecCount;
-                    queue<string> op_sel1(op_sel_s);
-                    c->resize_join(res_count);
-                    void* temp;
-                    CUDA_SAFE_CALL(cudaMalloc((void **) &temp, res_count*int_size));
-
-                    thrust::host_vector<unsigned int> prm_vh;
+                    queue<string> op_sel1(op_sel_s);					
+					c->resize_join(res_count);					
+					if(scratch.size() < res_count*int_size)
+						scratch.resize(res_count*int_size);
+					thrust::fill(scratch.begin(), scratch.begin() + res_count*int_size, 0);										
                     std::map<string,bool> processed;
-
-                    //std::clock_t start1 = std::clock();
+					
                     while(!op_sel1.empty()) {
 
                         if (processed.find(op_sel1.front()) != processed.end()) {
@@ -1262,41 +1382,36 @@ void emit_multijoin(const string s, const string j1, const string j2, const unsi
 
                         cc.push(op_sel1.front());
 
-                        if(std::find(left->columnNames.begin(), left->columnNames.end(), op_sel1.front()) !=  left->columnNames.end()) {
-                            allocColumns(left, cc);
-                            copyColumns(left, cc, i, k, 0, 0);
+                        if(std::find(left->columnNames.begin(), left->columnNames.end(), op_sel1.front()) !=  left->columnNames.end() && join_kind != '2') {												
+								allocColumns(left, cc);
+								copyColumns(left, cc, i, k, 0, 0);						
+								//gather
+								if(left->type[op_sel1.front()] != 1 ) {
+									thrust::device_ptr<int_type> d_tmp((int_type*)thrust::raw_pointer_cast(scratch.data()));
+									thrust::gather(p_tmp.begin(), p_tmp.begin() + res_count, left->d_columns_int[op_sel1.front()].begin(), d_tmp);
+									thrust::copy(d_tmp, d_tmp + res_count, c->h_columns_int[op_sel1.front()].begin() + offset);
+								}
+								else {
+									thrust::device_ptr<float_type> d_tmp((float_type*)thrust::raw_pointer_cast(scratch.data()));
+									thrust::gather(p_tmp.begin(), p_tmp.begin() + res_count, left->d_columns_float[op_sel1.front()].begin(), d_tmp);
+									thrust::copy(d_tmp, d_tmp + res_count, c->h_columns_float[op_sel1.front()].begin() + offset);
+								};
 
-                            //gather
-                            if(left->type[op_sel1.front()] != 1 ) {
-                                thrust::device_ptr<int_type> d_tmp((int_type*)temp);
-                                thrust::sequence(d_tmp, d_tmp+res_count,0,0);
-                                thrust::gather_if(p_tmp.begin(), p_tmp.begin() + res_count, p_tmp.begin(), left->d_columns_int[op_sel1.front()].begin(), d_tmp, is_positive<int>());
-                                thrust::copy(d_tmp, d_tmp + res_count, c->h_columns_int[op_sel1.front()].begin() + offset);
-                            }
-                            else {
-                                thrust::device_ptr<float_type> d_tmp((float_type*)temp);
-                                thrust::sequence(d_tmp, d_tmp+res_count,0,0);
-                                thrust::gather_if(p_tmp.begin(), p_tmp.begin() + res_count, p_tmp.begin(), left->d_columns_float[op_sel1.front()].begin(), d_tmp, is_positive<int>());
-                                thrust::copy(d_tmp, d_tmp + res_count, c->h_columns_float[op_sel1.front()].begin() + offset);
-                            }
-
-                            if(op_sel1.front() != colname1)
-                                left->deAllocColumnOnDevice(op_sel1.front());
+								if(op_sel1.front() != colname1)
+									left->deAllocColumnOnDevice(op_sel1.front());
+							//};
                         }
                         else if(std::find(right->columnNames.begin(), right->columnNames.end(), op_sel1.front()) !=  right->columnNames.end()) {
 
                             //gather
-                            std::clock_t start2 = std::clock();
                             if(right->type[op_sel1.front()] != 1) {
-                                thrust::device_ptr<int_type> d_tmp((int_type*)temp);
-                                thrust::sequence(d_tmp, d_tmp+res_count,0,0);
-                                thrust::gather_if(d_res2, d_res2 + res_count, d_res2, right->d_columns_int[op_sel1.front()].begin(), d_tmp, is_positive<int>());
-                                thrust::copy(d_tmp, d_tmp + res_count, c->h_columns_int[op_sel1.front()].begin() + offset);
+                                thrust::device_ptr<int_type> d_tmp((int_type*)thrust::raw_pointer_cast(scratch.data()));
+                                thrust::gather(d_res2, d_res2 + res_count, right->d_columns_int[op_sel1.front()].begin(), d_tmp);
+                                thrust::copy(d_tmp, d_tmp + res_count, c->h_columns_int[op_sel1.front()].begin() + offset);								
                             }
                             else {
-                                thrust::device_ptr<float_type> d_tmp((float_type*)temp);
-                                thrust::sequence(d_tmp, d_tmp+res_count,0,0);
-                                thrust::gather_if(d_res2, d_res2 + res_count, d_res2, right->d_columns_float[op_sel1.front()].begin(), d_tmp, is_positive<int>());
+                                thrust::device_ptr<float_type> d_tmp((float_type*)thrust::raw_pointer_cast(scratch.data()));
+                                thrust::gather(d_res2, d_res2 + res_count, right->d_columns_float[op_sel1.front()].begin(), d_tmp);
                                 thrust::copy(d_tmp, d_tmp + res_count, c->h_columns_float[op_sel1.front()].begin() + offset);
                             }
                         }
@@ -1304,13 +1419,77 @@ void emit_multijoin(const string s, const string j1, const string j2, const unsi
                         };
                         op_sel1.pop();
                     };
-                    cudaFree(temp);
                 };
+				//std::cout<< endl << "process cpy time " <<  ( ( std::clock() - start12 ) / (double)CLOCKS_PER_SEC ) << " " << getFreeMem() << endl;
             };
-            //std::cout<< endl << "seg time " <<  ( ( std::clock() - start2 ) / (double)CLOCKS_PER_SEC ) << " " << getFreeMem() << endl;
+            //std::cout<< endl << "seg time " <<  ( ( std::clock() - start12 ) / (double)CLOCKS_PER_SEC ) << " " << getFreeMem() << endl;
         };
     };
+	
+	if(join_type.front() == '4') {
+		thrust::device_vector<int> st(cnt_r);
+		thrust::sequence(st.begin(), st.end(),0,1);
+		thrust::device_vector<int> r(cnt_r);
+		auto new_end = thrust::set_difference(st.begin(), st.end(), ranj.begin(), ranj.end(), r.begin());	
+		ranj.resize(0);	
+		res_count = new_end - r.begin();
+		tot_count = res_count;
+		
+        queue<string> op_sel1(op_sel_s);					
+		c->resize_join(res_count);					
+		if(scratch.size() < res_count*int_size)
+			scratch.resize(res_count*int_size);
+		thrust::fill(scratch.begin(), scratch.begin() + res_count*int_size, 0);										
+        std::map<string,bool> processed;
+		
+		while(!op_sel1.empty()) {
+			if (processed.find(op_sel1.front()) != processed.end()) {
+				op_sel1.pop();
+				continue;
+			}
+			else
+				processed[op_sel1.front()] = 1;
 
+			while(!cc.empty())
+				cc.pop();
+
+			cc.push(op_sel1.front());			
+			thrust::device_ptr<int_type> d_tmp((int_type*)thrust::raw_pointer_cast(scratch.data()));
+			thrust::gather(r.begin(), r.end(), right->d_columns_int[op_sel1.front()].begin(), d_tmp);
+			thrust::copy(d_tmp, d_tmp + res_count, c->h_columns_int[op_sel1.front()].begin());				
+			op_sel1.pop();
+		};		
+	}
+	else if(join_type.front() == '2') {
+		res_count = ranj.size();
+		tot_count = res_count;		
+        queue<string> op_sel1(op_sel_s);					
+		c->resize_join(res_count);					
+		if(scratch.size() < res_count*int_size)
+			scratch.resize(res_count*int_size);
+		thrust::fill(scratch.begin(), scratch.begin() + res_count*int_size, 0);										
+        std::map<string,bool> processed;
+		
+		while(!op_sel1.empty()) {
+			if (processed.find(op_sel1.front()) != processed.end()) {
+				op_sel1.pop();
+				continue;
+			}
+			else
+				processed[op_sel1.front()] = 1;
+
+			while(!cc.empty())
+				cc.pop();
+
+			cc.push(op_sel1.front());			
+			thrust::device_ptr<int_type> d_tmp((int_type*)thrust::raw_pointer_cast(scratch.data()));
+			thrust::gather(ranj.begin(), ranj.end(), right->d_columns_int[op_sel1.front()].begin(), d_tmp);
+			thrust::copy(d_tmp, d_tmp + res_count, c->h_columns_int[op_sel1.front()].begin());				
+			op_sel1.pop();
+		};	
+		ranj.resize(0);			
+	};
+	
     if(set_p) {
         if(p_tmp1)
             cudaFree(p_tmp1);
@@ -1319,7 +1498,7 @@ void emit_multijoin(const string s, const string j1, const string j2, const unsi
         p_sz = p_tmp.size();
         thrust::copy(p_tmp.begin(), p_tmp.end(), d_tmp);
     };
-
+	
     left->deAllocOnDevice();
     right->deAllocOnDevice();
     c->deAllocOnDevice();
@@ -1331,53 +1510,7 @@ void emit_multijoin(const string s, const string j1, const string j2, const unsi
 
 
     if(verbose)
-        cout << endl << "tot res " << tot_count << " " << getFreeMem() << endl;
-
-    size_t tot_size = tot_count*8*c->columnNames.size();
-	
-    //super-important partitioning of result datasets
-    if (getFreeMem() > tot_size*3) {
-
-        //vector< map<string, set<unsigned int> > > border_segments;
-        map<string, set<unsigned int> > m;
-        for(auto& val : border_segments) {
-            for (auto it=val.begin(); it!=val.end(); ++it) {
-                for (auto its=(it->second).begin(); its!=(it->second).end(); ++its) {
-                    if(m[it->first].find(*its) != m[it->first].end()) {
-                        m[it->first].insert(*its);
-                        if(verbose)
-                            cout << "SEGS " << it->first << " : " << *its << endl;
-                    };
-                };
-            };
-        };
-        c->orig_segs.push_back(m);
-        c->maxRecs = tot_count;
-        c->segCount = 1;
-    }
-    else {
-        c->segCount = ((tot_size*3)/getFreeMem() + 1);
-        c->maxRecs = c->hostRecCount - (c->hostRecCount/c->segCount)*(c->segCount-1);
-        c->orig_segs.resize(c->segCount);
-        size_t bb;
-        for(auto i = 0; i < c->segCount; i++) {
-            bb = 0;
-            for(auto j = 0; j < border_boundaries.size(); j++) {
-                auto lower_b = bb;
-                auto upper_b = bb + border_boundaries[j];
-                //cout << "border " << j << " " << lower_b << " " << upper_b << endl;
-                bb = bb + border_boundaries[j];
-                if(i*c->maxRecs <= upper_b && (i+1)*c->maxRecs >= lower_b) {
-                    for(auto it = border_segments[j].begin(); it != border_segments[j].end(); ++it)	 {
-                        for (auto itr = it->second.begin(); itr != it->second.end(); itr++) {
-                            c->orig_segs[i][it->first].insert(*itr);
-                            //cout << "C " << i << " " << it->first << " " << *itr << endl;
-                        }
-                    };
-                }
-            };
-        };
-    };
+        cout << "tot res " << tot_count << " " << getFreeMem() << endl;
 
     if(right->tmp_table == 1) {
         right->free();
@@ -1393,7 +1526,22 @@ void emit_multijoin(const string s, const string j1, const string j2, const unsi
         left->free();
         varNames.erase(j1);
     };
-    join_type.pop();
+	
+	
+    join_type.pop();	
+	if(!join_eq_type.empty())
+		join_eq_type.pop();
+	
+    size_t tot_size = tot_count*8*c->columnNames.size();		
+    if (getFreeMem() > tot_size) {
+        c->maxRecs = tot_count;
+        c->segCount = 1;
+    }
+    else {		
+        c->segCount = ((tot_size)/getFreeMem() + 1);
+        c->maxRecs = c->hostRecCount - (c->hostRecCount/c->segCount)*(c->segCount-1);
+    };
+	
 
     if(verbose)
         std::cout<< "join time " <<  ( ( std::clock() - start1 ) / (double)CLOCKS_PER_SEC ) << " " << getFreeMem() << endl;
@@ -1461,13 +1609,16 @@ void emit_order(const char *s, const char *f, const int e, const int ll)
 {
     if(ll == 0)
         statement_count++;
-
+	
     if (scan_state == 0 && ll == 0) {
         if (stat.find(f) == stat.end() && data_dict.count(f) == 0) {
             process_error(2, "Order : couldn't find variable " + string(f));
         };
         stat[s] = statement_count;
         stat[f] = statement_count;
+		if(filter_var.find(f) != filter_var.end()) 
+			stat[filter_var[f]] = statement_count;
+
         return;
     };
 
@@ -1482,18 +1633,6 @@ void emit_order(const char *s, const char *f, const int e, const int ll)
     };
 
     CudaSet* a = varNames.find(f)->second;
-
-    /*if (a->mRecCount == 0)	{
-        if(varNames.find(s) == varNames.end())
-            varNames[s] = new CudaSet(0,1);
-        else {
-            CudaSet* c = varNames.find(s)->second;
-            c->mRecCount = 0;
-        };
-        return;
-    };
-    */
-
     stack<string> exe_type, exe_value;
 
     if(verbose)
@@ -1557,13 +1696,13 @@ void emit_order(const char *s, const char *f, const int e, const int ll)
             a->hostRecCount = a->mRecCount;
         };
 
-        a->cpy_strings = 1;
         a->mRecCount = load_queue(names, a, op_vx.front(), rcount, 0, a->segCount);
 
-        thrust::device_ptr<unsigned int> permutation = thrust::device_malloc<unsigned int>(a->mRecCount);
+		if(scratch.size() < a->mRecCount)
+			scratch.resize(a->mRecCount*4);
+		thrust::device_ptr<unsigned int> permutation((unsigned int*)thrust::raw_pointer_cast(scratch.data())); 
         thrust::sequence(permutation, permutation+(a->mRecCount));
-
-        unsigned int* raw_ptr = thrust::raw_pointer_cast(permutation);
+        unsigned int* perm_ptr = thrust::raw_pointer_cast(permutation);
 
         void* temp;
         CUDA_SAFE_CALL(cudaMalloc((void **) &temp, a->mRecCount*max_char(a)));
@@ -1581,12 +1720,12 @@ void emit_order(const char *s, const char *f, const int e, const int ll)
 
         for(int i=0; !exe_type.empty(); ++i, exe_type.pop(),exe_value.pop()) {
             if (a->type[exe_type.top()] == 0 && a->string_map.find(exe_type.top()) == a->string_map.end())
-                update_permutation(a->d_columns_int[exe_type.top()], raw_ptr, a->mRecCount, exe_value.top(), (int_type*)temp);
+                update_permutation(a->d_columns_int[exe_type.top()], perm_ptr, a->mRecCount, exe_value.top(), (int_type*)temp, 64);
             else if (a->type[exe_type.top()] == 1)
-                update_permutation(a->d_columns_float[exe_type.top()], raw_ptr, a->mRecCount,exe_value.top(), (float_type*)temp);
+                update_permutation(a->d_columns_float[exe_type.top()], perm_ptr, a->mRecCount,exe_value.top(), (float_type*)temp, 64);
             else {
                 //get strings to device
-                update_char_permutation(a, exe_type.top(), raw_ptr, exe_value.top(), temp, 0);
+                update_char_permutation(a, exe_type.top(), perm_ptr, exe_value.top(), temp, 0);
             };
         };
 
@@ -1595,10 +1734,10 @@ void emit_order(const char *s, const char *f, const int e, const int ll)
 
         for (unsigned int i = 0; i < a->mColumnCount; i++) {
             if (a->type[a->columnNames[i]] != 1) {
-                apply_permutation(a->d_columns_int[a->columnNames[i]], raw_ptr, a->mRecCount, (int_type*)temp);
+                apply_permutation(a->d_columns_int[a->columnNames[i]], perm_ptr, a->mRecCount, (int_type*)temp, 64);
             }
             else
-                apply_permutation(a->d_columns_float[a->columnNames[i]], raw_ptr, a->mRecCount, (float_type*)temp);
+                apply_permutation(a->d_columns_float[a->columnNames[i]], perm_ptr, a->mRecCount, (float_type*)temp, 64);
         };
 
         for(unsigned int i = 0; i < a->mColumnCount; i++) {
@@ -1611,7 +1750,6 @@ void emit_order(const char *s, const char *f, const int e, const int ll)
 
         b->deAllocOnDevice();
         a->deAllocOnDevice();
-        thrust::device_free(permutation);
         cudaFree(temp);
     };
 
@@ -1637,6 +1775,9 @@ void emit_select(const char *s, const char *f, const int grp_cnt)
         };
         stat[s] = statement_count;
         stat[f] = statement_count;
+		if(filter_var.find(f) != filter_var.end()) 
+			stat[filter_var[f]] = statement_count;
+		
         check_used_vars();
         clean_queues();
         return;
@@ -1730,7 +1871,6 @@ void emit_select(const char *s, const char *f, const int grp_cnt)
     // find out how many columns a new set will have
     queue<string> op_t(op_type);
     int_type col_count = 0;
-    a->cpy_strings = 0;
 
     for(int i=0; !op_t.empty(); ++i, op_t.pop())
         if((op_t.front()).compare("emit sel_name") == 0)
@@ -1752,7 +1892,7 @@ void emit_select(const char *s, const char *f, const int grp_cnt)
     a->hostRecCount = a->mRecCount;
     b = new CudaSet(0, col_count);
     b->name = "tmp b in select";
-    bool b_set = 0, c_set = 0;
+    bool c_set = 0;
 
     //size_t tmp_size = a->mRecCount;
     //if(a->segCount > 1)
@@ -1769,7 +1909,10 @@ void emit_select(const char *s, const char *f, const int grp_cnt)
      };
     */
 
-    bool one_liner;
+    bool one_liner;	
+	if (grp_cnt != 0)
+		phase_copy = 1;
+	
 
     for(unsigned int i = 0; i < cycle_count; i++) {          // MAIN CYCLE
         if(verbose)
@@ -1778,29 +1921,40 @@ void emit_select(const char *s, const char *f, const int grp_cnt)
 
         cnt = 0;
         copyColumns(a, op_vx, i, cnt);
+		//std::cout<< "cpy time " <<  ( ( std::clock() - start3 ) / (double)CLOCKS_PER_SEC ) <<  " " << getFreeMem() << '\n';				
 
         if(a->mRecCount) {
-            if (grp_cnt != 0) {
-                order_inplace(a, op_v2, field_names, 1);
-                a->GroupBy(op_v2);
-            };
-
-            select(op_type,op_value,op_nums, op_nums_f,a,b, distinct_tmp, one_liner);
-			//cout << "RES " << b->mRecCount << endl;
-			//for(int z= 0; z<b->mRecCount; z++)
-			//cout << b->d_columns_int["lf1"][z] << " " << b->d_columns_int["rf1"][z] << endl;
+            if (grp_cnt != 0) {			
+				bool srt = 0;
+				stack<string> op_vv(op_v2);
+				while(!op_vv.empty()) {
+					if(!min_max_eq[op_vv.top()])
+						srt = 1;
+					op_vv.pop();	
+				};
+				if(srt) {
+					order_inplace(a, op_v2, field_names, 1);																
+					a->GroupBy(op_v2);		
+				}
+				else {
+					if(a->grp.size() < a->mRecCount)
+						a->grp.resize(a->mRecCount);	
+					thrust::fill(a->grp.begin(),a->grp.begin()+a->mRecCount,0);
+					a->grp[a->mRecCount-1] = 1;
+					a->grp_count = 1;	
+				};	
+            }
+			else
+				a->grp_count = 0;			
+			
+			copyFinalize(a, op_vx);
+			
+			//start3 = std::clock();
+            select(op_type,op_value,op_nums, op_nums_f, op_nums_precision, a,b, distinct_tmp, one_liner);	
+			//std::cout<< "s time " <<  ( ( std::clock() - start3 ) / (double)CLOCKS_PER_SEC ) <<  '\n';				
 
             if(i == 0)
                 std::reverse(b->columnNames.begin(), b->columnNames.end());
-
-            if(!b_set) {
-                b_set = 1;
-                unsigned int old_cnt = b->mRecCount;
-                b->mRecCount = 0;
-                b->resize(a->maxRecs);
-                b->mRecCount = old_cnt;
-                b->cpy_strings = 0;
-            };
 
 
             if (!c_set && b->mRecCount > 0) {
@@ -1808,7 +1962,7 @@ void emit_select(const char *s, const char *f, const int grp_cnt)
                 create_c(c,b);
                 c_set = 1;
                 c->name = s;
-            };
+            };			
 
             if (grp_cnt && cycle_count > 1  && b->mRecCount > 0) {
                 add(c,b,op_v3, aliases, distinct_tmp, distinct_val, distinct_hash, a);
@@ -1827,14 +1981,22 @@ void emit_select(const char *s, const char *f, const int grp_cnt)
                     };
                 };
             };
+			//std::cout<< "add time " <<  ( ( std::clock() - start3 ) / (double)CLOCKS_PER_SEC ) <<  '\n';				
         };
         //std::cout<< "cycle sel time " <<  ( ( std::clock() - start3 ) / (double)CLOCKS_PER_SEC ) << " " << getFreeMem() << '\n';
     };
+	phase_copy = 0;
 
     a->mRecCount = ol_count;
     a->mRecCount = a->hostRecCount;
     a->deAllocOnDevice();
     b->deAllocOnDevice();
+	a->grp.resize(0);
+	a->grp.shrink_to_fit();
+	for(auto i = 0; i < alloced_mem.size(); i++) {
+		cudaFree(alloced_mem[i]);
+		alloced_mem.pop_back();
+	};
 
     if(!c_set) {
         CudaSet *c;
@@ -1859,7 +2021,6 @@ void emit_select(const char *s, const char *f, const int grp_cnt)
     c->string_map = b->string_map;
     c->name = s;
     c->keep = 1;
-    c->orig_segs = a->orig_segs;
     if(verbose)
         cout << "select res " << c->mRecCount << endl;
 		
@@ -2045,7 +2206,8 @@ void emit_display(const char *f, const char* sep)
             process_error(2, "Filter : couldn't find variable " + string(f) );
         };
         stat[f] = statement_count;
-        //check_used_vars();
+   		if(filter_var.find(f) != filter_var.end()) 
+			stat[filter_var[f]] = statement_count;
         clean_queues();
         return;
     };
@@ -2085,6 +2247,7 @@ void emit_filter(char *s, char *f)
         };
         stat[s] = statement_count;
         stat[f] = statement_count;
+		filter_var[s] = f;
         // check possible use of other variables in filters
         queue<string> op(op_value);
         while(!op.empty()) {
@@ -2124,7 +2287,8 @@ void emit_filter(char *s, char *f)
 
         b->fil_value = op_value;
         b->fil_nums = op_nums;
-        b->fil_nums_f = op_nums_f;
+        b->fil_nums_f = op_nums_f;		
+		b->fil_nums_precision = op_nums_precision;
         b->filtered = 1;
         b->tmp_table = a->tmp_table;
         b->string_map = a->string_map;
@@ -2153,7 +2317,6 @@ void emit_filter(char *s, char *f)
                 a->fil_nums_f.pop();
             };
             a->filtered = 0;
-            //a->free();
             varNames.erase(f);
         }
         else
@@ -2183,7 +2346,8 @@ void emit_store(const char *s, const char *f, const char* sep)
             process_error(2, "Store : couldn't find variable " + string(s) );
         };
         stat[s] = statement_count;
-        //check_used_vars();
+		if(filter_var.find(f) != filter_var.end()) 
+			stat[filter_var[f]] = statement_count;
         clean_queues();
         return;
     };
@@ -2201,7 +2365,6 @@ void emit_store(const char *s, const char *f, const char* sep)
         op_nums.pop();
     };
 
-    a->cpy_strings = 0;
     a->Store(f,sep, limit, 0);
 
     if(stat[s] == statement_count  && a->keep == 0) {
@@ -2219,7 +2382,8 @@ void emit_store_binary(const char *s, const char *f)
             process_error(2, "Store : couldn't find variable " + string(s));
         };
         stat[s] = statement_count;
-        //check_used_vars();
+		if(filter_var.find(f) != filter_var.end()) 
+			stat[filter_var[f]] = statement_count;
         clean_queues();
         return;
     };
@@ -2228,7 +2392,6 @@ void emit_store_binary(const char *s, const char *f)
         return;
 
     CudaSet* a = varNames.find(s)->second;
-    a->cpy_strings = 1;
 
     if(stat[f] == statement_count)
         a->deAllocOnDevice();
@@ -2242,24 +2405,32 @@ void emit_store_binary(const char *s, const char *f)
     };
     total_count = 0;
     total_segments = 0;
-
+	a->maxRecs = 0;
+	
     if(fact_file_loaded) {
         a->Store(f,"", limit, 1);
     }
     else {
         FILE* file_p;
         if(a->text_source) {
-            file_p = fopen(a->load_file_name.c_str(), "r");
+            file_p = fopen(a->load_file_name.c_str(), "rb");
             if (!file_p) {
                 process_error(2, "Could not open file " + a->load_file_name );
             };
-        };
+        };		
 
+		thrust::device_vector<char> d_readbuff;
+		thrust::device_vector<char*> dest(a->mColumnCount);
+		thrust::device_vector<unsigned int> ind(a->mColumnCount);
+		thrust::device_vector<unsigned int> dest_len(a->mColumnCount);	
+		
         while(!fact_file_loaded) {
             if(verbose)
                 cout << "LOADING " << a->load_file_name << " mem: " << getFreeMem() << endl;
             if(a->text_source)
-                fact_file_loaded = a->LoadBigFile(file_p);
+                fact_file_loaded = a->LoadBigFile(file_p, d_readbuff, dest, ind, dest_len);
+			if(a->maxRecs < a->mRecCount)
+				a->maxRecs = a->mRecCount;
             a->Store(f,"", limit, 1);
         };
     };
@@ -2284,6 +2455,7 @@ void emit_load_binary(const char *s, const char *f, const int d)
     if(verbose)
         printf("BINARY LOAD: %s %s \n", s, f);
 
+	//std::clock_t start1 = std::clock();	
     CudaSet *a;
     unsigned int segCount, maxRecs;
     string f1(f);
@@ -2306,21 +2478,15 @@ void emit_load_binary(const char *s, const char *f, const int d)
     a = new CudaSet(namevars, typevars, sizevars, cols, totRecs, f, maxRecs);
 
     a->segCount = segCount;
-    a->keep = 1;
+    a->keep = true;
     a->name = s;
-    a->hostRecCount = totRecs;
     varNames[s] = a;
-    for(unsigned int i = 0; i < segCount; i++) {
-        map<string, set<unsigned int> > m;
-        m[f].insert(i);
-        a->orig_segs.push_back(m);
-        //cout << a->name << " " << f << " " << i << endl;
-    };
 
     if(stat[s] == statement_count )  {
         a->free();
         varNames.erase(s);
     };
+	//std::cout<< "load time " <<  ( ( std::clock() - start1 ) / (double)CLOCKS_PER_SEC ) << " " << getFreeMem() << '\n';
 }
 
 
@@ -2336,16 +2502,11 @@ void emit_load(const char *s, const char *f, const int d, const char* sep)
 
     CudaSet *a;
 
-    a = new CudaSet(namevars, typevars, sizevars, cols, process_count, references, references_names);
-    a->mRecCount = 0;
-    a->cpy_strings = 1;
-    a->resize(process_count);
+    a = new CudaSet(namevars, typevars, sizevars, cols, process_count);
     a->keep = true;
     a->not_compressed = 1;
     a->load_file_name = f;
     a->separator = sep;
-    a->maxRecs = a->mRecCount;
-    a->segCount = 0;
     varNames[s] = a;
     fact_file_loaded = 0;
 
@@ -2354,6 +2515,33 @@ void emit_load(const char *s, const char *f, const int d, const char* sep)
         varNames.erase(s);
     };
 }
+
+void emit_stream(const char *s, const char *f, const int d, const char* sep)
+{
+    statement_count++;
+    if (scan_state == 0) {
+        stat[s] = statement_count;
+        return;
+    };
+
+    printf("LOAD: %s %s %d  %s \n", s, f, d, sep);
+
+    CudaSet *a;
+
+    a = new CudaSet(namevars, typevars, sizevars, cols, process_count);
+    a->keep = true;
+    a->not_compressed = 1;
+    a->load_file_name = f;
+    a->separator = sep;
+    varNames[s] = a;
+    fact_file_loaded = 0;
+
+    if(stat[s] == statement_count)  {
+        a->free();
+        varNames.erase(s);
+    };
+}
+
 
 void emit_show_tables()
 {
@@ -2407,7 +2595,10 @@ void emit_describe_table(const char* table_name)
             auto s = (*iter).second;
             for (auto it=s.begin() ; it != s.end(); ++it ) {
                 if ((*it).second.col_type == 0) {
-                    cout << (*it).first << " integer" << endl;
+					if((*it).second.col_length)
+						cout << (*it).first << " decimal with precision of " << (*it).second.col_length << endl;
+					else	
+						cout << (*it).first << " integer" << endl;
                 }
                 else if ((*it).second.col_type == 1) {
                     cout << (*it).first << " float" << endl;
@@ -2435,10 +2626,6 @@ void yyerror(char *s, ...)
     error_cb(1, s);
 }
 
-void
-alenkaSetSegSize(long segsize) {
-    process_count = segsize;
-}
 
 void clean_queues()
 {
@@ -2447,17 +2634,17 @@ void clean_queues()
     while(!op_join.empty()) op_join.pop();
     while(!op_nums.empty()) op_nums.pop();
     while(!op_nums_f.empty()) op_nums_f.pop();
+	while(!op_nums_precision.empty()) op_nums_precision.pop();
     while(!j_col_count.empty()) j_col_count.pop();
     while(!namevars.empty()) namevars.pop();
     while(!typevars.empty()) typevars.pop();
     while(!sizevars.empty()) sizevars.pop();
     while(!cols.empty()) cols.pop();
     while(!op_sort.empty()) op_sort.pop();
-    while(!references.empty()) references.pop();
-    while(!references_names.empty()) references_names.pop();
     while(!op_presort.empty()) op_presort.pop();
     while(!join_type.empty()) join_type.pop();
-
+	while(!join_eq_type.empty()) join_eq_type.pop();
+		
     op_case = 0;
     sel_count = 0;
     join_cnt = 0;
@@ -2486,12 +2673,16 @@ void load_vars()
                 for (auto sit=c.begin() ; sit != c.end(); ++sit ) {
                     //cout << "name " << (*sit).first << " " << data_dict[(*it).first][(*sit).first].col_length << endl;
                     namevars.push((*sit).first);
-                    if(data_dict[(*it).first][(*sit).first].col_type == 0)
-                        typevars.push("int");
+                    if(data_dict[(*it).first][(*sit).first].col_type == 0) {
+						if(data_dict[(*it).first][(*sit).first].col_length == 0) {
+							typevars.push("int");
+						}	
+						else {
+							typevars.push("decimal");
+						}	
+					}	
                     else if(data_dict[(*it).first][(*sit).first].col_type == 1)
                         typevars.push("float");
-                    else if(data_dict[(*it).first][(*sit).first].col_type == 3)
-                        typevars.push("decimal");
                     else typevars.push("char");
                     sizevars.push(data_dict[(*it).first][(*sit).first].col_length);
                     cols.push(0);
@@ -2523,13 +2714,12 @@ void process_error(int severity, string err) {
 
 void alenkaInit(char ** av)
 {
-    process_count = 6200000;
+    process_count = 1000000000;
     verbose = 0;
     scan_state = 1;
     statement_count = 0;
-    clean_queues();
+    clean_queues();	
     context = CreateCudaDevice(0, nullptr, true);
-    printf("Alenka initialised\n");
 }
 
 
@@ -2541,11 +2731,6 @@ void alenkaClose()
         cudaFree(alloced_tmp);
         alloced_sz = 0;
     };
-    if(raw_decomp_length) {
-        cudaFree(raw_decomp);
-        raw_decomp_length = 0;
-    };
-    printf("Alenka closed\n");
 }
 
 

@@ -33,7 +33,7 @@
 %token <strval> NAME
 %token <strval> STRING
 %token <intval> INTNUM
-%token <intval> DECIMAL1
+%token <strval> DECIMAL1
 %token <intval> BOOL1
 %token <floatval> APPROXNUM
 /* user @abc names */
@@ -41,10 +41,12 @@
 /* operators and precedence levels */
 %right ASSIGN
 %right EQUAL
+%right NONEQUAL
 %left OR
 %left XOR
 %left AND
 %left DISTINCT
+%left YEAR
 %nonassoc IN IS LIKE REGEXP
 %left NOT '!'
 %left BETWEEN
@@ -82,9 +84,12 @@
 %token ON
 %token BINARY
 %token DISTINCT
+%token YEAR
 %token LEFT
 %token RIGHT
 %token OUTER
+%token SEMI
+%token ANTI
 %token AND
 %token SORT
 %token SEGMENTS
@@ -98,14 +103,12 @@
 %token THEN
 %token ELSE
 %token END
-%token REFERENCES
 %token SHOW
 %token TABLES
 %token TABLE
 %token DESCRIBE
 %token DROP
 %token CREATE
-%token BITMAP
 %token INDEX
 
 %type <intval> load_list  opt_where opt_limit sort_def
@@ -151,8 +154,8 @@ NAME ASSIGN SELECT expr_list FROM NAME opt_group_list
 {  emit_show_tables();}
 | DROP TABLE NAME
 {  emit_drop_table($3);}
-| CREATE BITMAP INDEX NAME ON NAME '(' NAME '.' NAME ')' FROM NAME ',' NAME WHERE NAME '.' NAME EQUAL NAME '.' NAME
-{  emit_create_bitmap_index($4, $6, $8, $10, $19, $23);};
+| CREATE INDEX NAME ON NAME '(' NAME '.' NAME ')' FROM NAME ',' NAME WHERE NAME '.' NAME EQUAL NAME '.' NAME
+{  emit_create_bitmap_index($3, $5, $7, $9, $18, $22);};
 
 
 expr:
@@ -161,12 +164,11 @@ NAME { emit_name($1); }
 | USERVAR { emit("USERVAR %s", $1); }
 | STRING { emit_string($1); }
 | INTNUM { emit_number($1); }
-| APPROXNUM { emit_float($1); }
 | DECIMAL1 { emit_decimal($1); }
+| APPROXNUM { emit_float($1); }
 | BOOL1 { emit("BOOL %d", $1); }
-| NAME '{' INTNUM '}' ':' NAME '(' INTNUM ')' REFERENCES NAME '(' NAME ')' { emit_varchar($1, $3, $6, $8, $11, $13);}
+| NAME '{' INTNUM '}' ':' NAME '(' INTNUM ',' INTNUM ')' { emit_vardecimal($1, $3, $6,  $8, $10);}
 | NAME '{' INTNUM '}' ':' NAME '(' INTNUM ')' { emit_varchar($1, $3, $6, $8, "", "");}
-| NAME '{' INTNUM '}' ':' NAME REFERENCES NAME '(' NAME ')' { emit_var($1, $3, $6, $8, $10);}
 | NAME '{' INTNUM '}' ':' NAME  { emit_var($1, $3, $6, "", "");}
 | NAME ASC { emit_var_asc($1);}
 | NAME DESC { emit_var_desc($1);}
@@ -176,6 +178,7 @@ NAME { emit_name($1); }
 | MIN '(' expr ')' { emit_min(); }
 | MAX '(' expr ')' { emit_max(); }
 | DISTINCT expr { emit_distinct(); }
+| YEAR '(' expr ')' { emit_year(); }
 ;
 
 expr:
@@ -188,6 +191,7 @@ expr '+' expr { emit_add(); }
 /*| '-' expr %prec UMINUS { emit("NEG"); }*/
 | expr AND expr { emit_and(); }
 | expr EQUAL expr { emit_eq(); }
+| expr NONEQUAL expr { emit_neq(); }
 | expr OR expr { emit_or(); }
 | expr XOR expr { emit("XOR"); }
 | expr SHIFT expr { emit("SHIFT %s", $2==1?"left":"right"); }
@@ -238,12 +242,20 @@ BY expr { emit("FILTER BY"); };
 
 join_list:
 JOIN NAME ON expr { $$ = 1; emit_join_tab($2, 'I');}
-| LEFT JOIN NAME ON expr { $$ = 1; emit_join_tab($3, 'L');}
+| LEFT ANTI JOIN  NAME ON expr { $$ = 1; emit_join_tab($4, '3');}
+| RIGHT ANTI JOIN NAME ON expr { $$ = 1; emit_join_tab($4, '4');}
+| LEFT SEMI JOIN NAME ON expr { $$ = 1; emit_join_tab($4, '1');}
+| LEFT JOIN NAME ON expr { $$ = 1; emit_join_tab($3, 'S');}
 | RIGHT JOIN NAME ON expr { $$ = 1; emit_join_tab($3, 'R');}
+| RIGHT SEMI JOIN NAME ON expr { $$ = 1; emit_join_tab($4, '2');}
 | OUTER JOIN NAME ON expr { $$ = 1; emit_join_tab($3, 'O');}
 | JOIN NAME ON expr join_list { $$ = 1; emit_join_tab($2, 'I'); };
+| LEFT ANTI JOIN NAME ON expr join_list { $$ = 1; emit_join_tab($4, '3'); };
+| RIGHT ANTI JOIN NAME ON expr join_list { $$ = 1; emit_join_tab($4, '4'); };
 | LEFT JOIN NAME ON expr join_list { $$ = 1; emit_join_tab($3, 'L'); };
+| LEFT SEMI JOIN NAME ON expr join_list { $$ = 1; emit_join_tab($4, '1'); };
 | RIGHT JOIN NAME ON expr join_list { $$ = 1; emit_join_tab($3, 'R'); };
+| RIGHT SEMI JOIN NAME ON expr join_list { $$ = 1; emit_join_tab($4, 'R'); };
 | OUTER JOIN NAME ON expr join_list { $$ = 1; emit_join_tab($3, 'O'); };
 
 opt_limit: { /* nil */
@@ -267,8 +279,7 @@ int execute_file(int ac, char **av)
 {
     bool just_once  = 0;
     string script;
-
-    process_count = 6200000;
+    process_count = 1000000000; //1GB by default
     verbose = 0;
 	ssd = 0;
 	delta = 0;
@@ -277,7 +288,7 @@ int execute_file(int ac, char **av)
 
     for (int i = 1; i < ac; i++) {
         if(strcmp(av[i],"-l") == 0) {
-            process_count = atoff(av[i+1]);
+            process_count = 1000000*atoff(av[i+1]);
         }
         else if(strcmp(av[i],"-v") == 0) {
             verbose = 1;
@@ -320,6 +331,7 @@ int execute_file(int ac, char **av)
 		
         statement_count = 0;
         clean_queues();
+		filter_var.clear();
 
         yyin = fopen(av[ac-1], "r");
         PROC_FLUSH_BUF ( yyin );
@@ -369,6 +381,7 @@ int execute_file(int ac, char **av)
 
             statement_count = 0;
             clean_queues();
+			filter_var.clear();
             yy_scan_string(script.c_str());
             std::clock_t start1 = std::clock();
 
@@ -391,7 +404,8 @@ int execute_file(int ac, char **av)
         };
 
         while(!buffer_names.empty()) {
-            delete [] buffers[buffer_names.front()];
+            //delete [] buffers[buffer_names.front()];
+			cudaFreeHost(buffers[buffer_names.front()]);
             buffer_sizes.erase(buffer_names.front());
             buffers.erase(buffer_names.front());
             buffer_names.pop();
@@ -401,18 +415,18 @@ int execute_file(int ac, char **av)
         };
 
     };
-    if(save_dict)
+    if(save_dict) {
         save_col_data(data_dict,"data.dictionary");
+	};	
 
     if(alloced_sz) {
         cudaFree(alloced_tmp);
         alloced_sz = 0;
     };
-    if(raw_decomp_length) {
-        cudaFree(raw_decomp);
-        raw_decomp_length = 0;
-    };
-
+	scratch.resize(0);
+	scratch.shrink_to_fit();
+	ranj.resize(0);
+	ranj.shrink_to_fit();
     return 0;
 }
 

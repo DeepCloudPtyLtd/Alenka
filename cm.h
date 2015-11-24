@@ -70,10 +70,11 @@ extern queue<string> op_presort;
 extern queue<string> op_value;
 extern queue<int_type> op_nums;
 extern queue<float_type> op_nums_f;
+extern queue<unsigned int> op_nums_precision; //decimals' precision
 extern queue<string> col_aliases;
 extern size_t total_count, oldCount, total_max, totalRecs, alloced_sz;
 extern unsigned int total_segments;
-extern unsigned int process_count;
+extern size_t process_count;
 extern bool fact_file_loaded;
 extern void* alloced_tmp;
 extern unsigned int partition_count;
@@ -91,24 +92,27 @@ extern map<string, char*> buffers;
 extern map<string, size_t> buffer_sizes;
 extern queue<string> buffer_names;
 extern size_t total_buffer_size;
-extern unsigned long long int* raw_decomp;
-extern unsigned int raw_decomp_length;
+extern thrust::device_vector<unsigned char> scratch;
+extern thrust::device_vector<int> ranj;
 extern size_t alloced_sz;
-extern void* alloced_tmp;
 extern ContextPtr context;
-extern unordered_map<string, unordered_map<unsigned long long int, size_t> > char_hash; // mapping between column's string hashes and string positions
+extern map<unsigned int, map<unsigned long long int, size_t> > char_hash; // mapping between column's string hashes and string positions
 extern bool scan_state;
 extern unsigned int statement_count;
 extern map<string, map<string, bool> > used_vars;
-
-
+extern map<string, unsigned int> cpy_bits;
+extern map<string, long long int> cpy_init_val;
+extern bool phase_copy;
+extern map<string,bool> min_max_eq;
+extern vector<void*> alloced_mem;
+extern map<string, string> filter_var; 
 
 template<typename T>
 struct uninitialized_host_allocator
         : std::allocator<T>
 {
     // note that construct is annotated as
-    __host__ __device__
+    __host__ 
     void construct(T *p)
     {
         // no-op
@@ -129,15 +133,6 @@ struct uninitialized_allocator
     }
 };
 
-template<typename T>
-struct is_positive
-{
-    __host__ __device__
-    bool operator()(const T x)
-    {
-        return (x >= 0);
-    }
-};
 
 struct set_minus : public binary_function<int,bool,int>
 {
@@ -164,31 +159,18 @@ struct head_flag_predicate
 
 struct float_to_long
 {
-    __host__ __device__
+    __device__
     long long int operator()(const float_type x)
     {
-        if ((long long int)((x+EPSILON)*100.0) > (long long int)(x*100.0))
-            return (long long int)((x+EPSILON)*100.0);
-        else return (long long int)(x*100.0);
-
-
+		return __double2ll_rn(x*100);
     }
 };
 
 struct float_equal_to
 {
-    /*! Function call operator. The return value is <tt>lhs == rhs</tt>.
-     */
-    __host__ __device__ bool operator()(const float_type &lhs, const float_type &rhs) const {
-        int_type l,r;
-        if ((long long int)((lhs+EPSILON)*100.0) > (long long int)(lhs*100.0))
-            l = (long long int)((lhs+EPSILON)*100.0);
-        else l = (long long int)(lhs*100.0);
-        if ((long long int)((rhs+EPSILON)*100.0) > (long long int)(rhs*100.0))
-            r = (long long int)((rhs+EPSILON)*100.0);
-        else r = (long long int)(rhs*100.0);
-
-        return (l == r);
+    __device__ 
+	bool operator()(const float_type &lhs, const float_type &rhs) const {
+		return (__double2ll_rn(lhs*100) == __double2ll_rn(rhs*100));
     }
 };
 
@@ -222,13 +204,312 @@ struct long_to_float
 };
 
 
-template<typename T>
-  struct not_identity : public unary_function<T,T>
+struct is_break
 {
-  /*! Function call operator. The return value is <tt>x</tt>.
-   */
-  __host__ __device__ const T &operator()(const T &x) const {return !x;}
-}; 
+ __host__ __device__
+ bool operator()(const char x)
+ {
+   return x == '\n';
+ }
+};
+
+struct gpu_date
+{
+	const char *source;
+    long long int *dest;
+		
+	gpu_date(const char *_source, long long int *_dest):
+			  source(_source), dest(_dest) {}
+    template <typename IndexType>
+    __host__ __device__
+    void operator()(const IndexType & i) {	
+		const char *s;
+		long long int acc;
+		int z = 0, c;
+		
+		s = source + 15*i;		
+		c = (unsigned char) *s++;
+
+		for (acc = 0; z < 10; c = (unsigned char) *s++) {
+			if(c != '-') {
+				c -= '0';
+				acc *= 10;
+				acc += c;
+			};	
+			z++;		
+		}		
+		dest[i] = acc;	
+	}
+};	
+
+
+struct gpu_atof
+{
+	const char *source;
+    double *dest;
+	const unsigned int *len;
+	
+	gpu_atof(const char *_source, double *_dest, const unsigned int *_len):
+			  source(_source), dest(_dest), len(_len) {}
+    template <typename IndexType>
+    __host__ __device__
+    void operator()(const IndexType & i) {	
+		const char *p;
+		int frac;
+		double sign, value, scale;	
+		
+		p = source + len[0]*i;		
+		
+    	while (*p == ' ') {
+			p += 1;
+		}
+    
+		sign = 1.0;
+		if (*p == '-') {
+			sign = -1.0;
+			p += 1;
+		} else if (*p == '+') {
+			p += 1;
+		}
+		
+		for (value = 0.0; *p >= '0' && *p <= '9'; p += 1) {
+			value = value * 10.0 + (*p - '0');
+		}
+
+        if (*p == '.') {
+			double pow10 = 10.0;
+			p += 1;
+			while (*p >= '0' && *p <= '9') {
+				value += (*p - '0') / pow10;
+				pow10 *= 10.0;
+				p += 1;
+			}
+		}
+		
+		frac = 0;
+		scale = 1.0;
+		
+		dest[i] = sign * (frac ? (value / scale) : (value * scale));		
+	}
+};	
+
+
+
+struct gpu_atod
+{
+	const char *source;
+    int_type *dest;
+	const unsigned int *len;
+	const unsigned int *sc;
+	
+	gpu_atod(const char *_source, int_type *_dest, const unsigned int *_len, const unsigned int *_sc):
+			  source(_source), dest(_dest), len(_len), sc(_sc) {}
+    template <typename IndexType>
+    __host__ __device__
+    void operator()(const IndexType & i) {	
+		const char *p;
+		int frac;
+		double sign, value, scale;	
+		
+		p = source + len[0]*i;		
+		
+    	while (*p == ' ') {
+			p += 1;
+		}
+    
+		sign = 1.0;
+		if (*p == '-') {
+			sign = -1.0;
+			p += 1;
+		} else if (*p == '+') {
+			p += 1;
+		}
+		
+		for (value = 0.0; *p >= '0' && *p <= '9'; p += 1) {
+			value = value * 10.0 + (*p - '0');
+		}
+
+        if (*p == '.') {
+			double pow10 = 10.0;
+			p += 1;
+			while (*p >= '0' && *p <= '9') {
+				value += (*p - '0') / pow10;
+				pow10 *= 10.0;
+				p += 1;
+			}
+		}
+		
+		frac = 0;
+		scale = 1.0;
+		
+		dest[i] = (sign * (frac ? (value / scale) : (value * scale)))*sc[0];		
+	}
+};	
+
+
+struct gpu_atold
+{
+	const char *source;
+    long long int *dest;
+	const unsigned int *len;
+	const unsigned int *sc;
+	
+	gpu_atold(const char *_source, long long int *_dest, const unsigned int *_len, const unsigned int *_sc):
+			  source(_source), dest(_dest), len(_len), sc(_sc) {}
+    template <typename IndexType>
+    __host__ __device__
+    void operator()(const IndexType & i) {	
+		const char *s;
+		long long int acc;
+		int c;
+		int neg;
+		int point = 0;	
+		bool cnt = 0;
+		
+		s = source + len[0]*i;		
+	
+		do {
+			c = (unsigned char) *s++;
+		} while (c == ' ');				
+		
+		if (c == '-') {
+			neg = 1;
+			c = *s++;
+		} else {
+			neg = 0;
+			if (c == '+')
+				c = *s++;
+		}		
+		
+		for (acc = 0;; c = (unsigned char) *s++) {
+			if (c >= '0' && c <= '9')
+				c -= '0';
+			else {
+				if(c != '.')
+					break;
+				cnt = 1;
+				continue;
+			};	
+			if (c >= 10)
+				break;	
+			if (neg) {
+				acc *= 10;
+				acc -= c;
+			} 
+			else {
+				acc *= 10;
+				acc += c;
+			}		
+			if(cnt)
+				point++;
+			if(point == sc[0])
+				break;
+		}		
+		dest[i] = acc * (unsigned int)exp10((double)sc[0]- point);	
+	}
+};
+
+
+struct gpu_atoll
+{
+	const char *source;
+    long long int *dest;
+	const unsigned int *len;
+	
+	gpu_atoll(const char *_source, long long int *_dest, const unsigned int *_len):
+			  source(_source), dest(_dest), len(_len) {}
+    template <typename IndexType>
+    __host__ __device__
+    void operator()(const IndexType & i) {	
+		const char *s;
+		long long int acc;
+		int c;
+		int neg;						
+		
+		s = source + len[0]*i;		
+	
+		do {
+			c = (unsigned char) *s++;
+		} while (c == ' ');				
+		
+		if (c == '-') {
+			neg = 1;
+			c = *s++;
+		} else {
+			neg = 0;
+			if (c == '+')
+				c = *s++;
+		}		
+		
+		for (acc = 0;; c = (unsigned char) *s++) {
+			if (c >= '0' && c <= '9')
+				c -= '0';
+			else
+				break;
+			if (c >= 10)
+				break;	
+			if (neg) {
+				acc *= 10;
+				acc -= c;
+			} 
+			else {
+				acc *= 10;
+				acc += c;
+			}		
+		}		
+		dest[i] = acc;	
+	}
+};
+
+   
+struct parse_functor
+{
+	const char *source;
+    char **dest;
+    const unsigned int *ind;
+	const unsigned int *cnt;
+	const char *separator;
+	const long long int *src_ind;
+	const unsigned int *dest_len;
+
+    parse_functor(const char* _source, char** _dest, const unsigned int* _ind, const unsigned int* _cnt, const char* _separator,
+				  const long long int* _src_ind, const unsigned int* _dest_len):
+        source(_source), dest(_dest), ind(_ind), cnt(_cnt),  separator(_separator), src_ind(_src_ind), dest_len(_dest_len) {}
+
+    template <typename IndexType>
+    __host__ __device__
+    void operator()(const IndexType & i) {
+		unsigned int curr_cnt = 0, dest_curr = 0, j = 0, t, pos;
+		pos = src_ind[i]+1;
+		
+		while(dest_curr < *cnt) {
+			if(ind[dest_curr] == curr_cnt) { //process				
+				t = 0;
+				while(source[pos+j] != *separator) {
+					//printf("REG %d ", j);
+					if(source[pos+j] != 0) {
+						dest[dest_curr][dest_len[dest_curr]*i+t] = source[pos+j];
+						t++;
+					};	
+					j++;					
+				};
+				j++;
+				dest_curr++;				
+			}
+			else {
+				//printf("Skip %d \n", j);
+				while(source[pos+j] != *separator) {
+					j++;
+					//printf("CONT Skip %d \n", j);
+				};	
+				j++;
+			};
+			curr_cnt++;			
+			//printf("DEST CURR %d %d %d %d \n" , j, dest_curr, ind[dest_curr], curr_cnt);
+		}
+		
+    }
+};
 
 
 #ifdef _WIN64
@@ -243,28 +524,20 @@ struct col_data {
 extern map<string, map<string, col_data> > data_dict;
 
 
+
 class CudaSet
 {
 public:
-    //map<string, thrust::host_vector<int_type, pinned_allocator<int_type> > > h_columns_int;
-	map<string, thrust::host_vector<int_type> > h_columns_int;
-    //map<string, thrust::host_vector<float_type, pinned_allocator<float_type> > > h_columns_float;	
-	map<string, thrust::host_vector<float_type> > h_columns_float;	
+    map<string, thrust::host_vector<int_type, pinned_allocator<int_type> > > h_columns_int;
+    map<string, thrust::host_vector<float_type, pinned_allocator<float_type> > > h_columns_float;	
     map<string, char*> h_columns_char;
-	/*std::vector<thrust::host_vector<int32_type, pinned_allocator<int32_type> > > h_columns_int32;
-	std::vector<thrust::host_vector<int16_type, pinned_allocator<int16_type> > > h_columns_int16;
-	std::vector<thrust::host_vector<int8_type, pinned_allocator<int8_type> > > h_columns_int8;	
-	*/
-
     map<string, thrust::device_vector<int_type > > d_columns_int;
     map<string, thrust::device_vector<float_type > > d_columns_float;	
-    map<string, char*> d_columns_char;		
-	
+    map<string, char*> d_columns_char;			
     map<string, size_t> char_size;
     thrust::device_vector<unsigned int> prm_d;
-	map<string, string> string_map; //maps char column names to string files, only select operator changes the original mapping
+	map<string, string> string_map; //maps char column names to string files, only a select operator changes the original mapping
     char prm_index; // A - all segments values match, N - none match, R - some may match
-	//map<string, map<string, unsigned int> > idx_dictionary_str; //stored in host memory
 	map<string, map<int_type, unsigned int> > idx_dictionary_int; //stored in host memory
 	map<string, unsigned long long int*> idx_vals; // pointer to compressed values in gpu memory
 
@@ -273,37 +546,31 @@ public:
     queue<string> fil_type,fil_value;
     queue<int_type> fil_nums;
     queue<float_type> fil_nums_f;
-
+	queue<unsigned int> fil_nums_precision;
+	
     size_t mRecCount, maxRecs, hostRecCount, devRecCount, grp_count, segCount, totalRecs;
     vector<string> columnNames;
 	map<string,bool> compTypes; // pfor delta or not
     map<string, FILE*> filePointers;
-    bool *grp;
-    queue<string> columnGroups;
+    thrust::device_vector<bool> grp;
     bool not_compressed; // 1 = host recs are not compressed, 0 = compressed
     unsigned int mColumnCount;
     string name, load_file_name, separator, source_name;
-    bool source, text_source, tmp_table, keep, filtered, cpy_strings;
+    bool source, text_source, tmp_table, keep, filtered;
     queue<string> sorted_fields; //segment is sorted by fields
     queue<string> presorted_fields; //globally sorted by fields
     map<string, unsigned int> type; // 0 - integer, 1-float_type, 2-char
     map<string, bool> decimal; // column is decimal - affects only compression
+	map<string, unsigned int> decimal_zeroes; // number of zeroes in decimals
     map<string, unsigned int> grp_type; // type of group : SUM, AVG, COUNT etc
     map<unsigned int, string> cols; // column positions in a file
 	map<string, bool> map_like; //for LIKE processing
-	map<string, thrust::device_vector<unsigned int> > map_res; //also for LIKE processing
+	map<string, thrust::device_vector<unsigned int> > map_res; //also for LIKE processing	
 	
-	//alternative to Bloom filters. Keep track of non-empty segment join results ( not the actual results
-	//but just boolean indicators.
-	map<string, string> ref_sets; // referencing datasets
-	map<string, string> ref_cols; // referencing dataset's column names
-	map<string, map<unsigned int, set<unsigned int> > > ref_joins; // columns referencing dataset segments 
-	vector< map<string, set<unsigned int> > > orig_segs;
-
-    CudaSet(queue<string> &nameRef, queue<string> &typeRef, queue<int> &sizeRef, queue<int> &colsRef, size_t Recs, queue<string> &references, queue<string> &references_names);
+    CudaSet(queue<string> &nameRef, queue<string> &typeRef, queue<int> &sizeRef, queue<int> &colsRef, size_t Recs);
     CudaSet(queue<string> &nameRef, queue<string> &typeRef, queue<int> &sizeRef, queue<int> &colsRef, size_t Recs, string file_name, unsigned int max);
-    CudaSet(size_t RecordCount, unsigned int ColumnCount);
-	CudaSet(queue<string> op_sel, queue<string> op_sel_as, queue<string> op_join);
+    CudaSet(const size_t RecordCount, const unsigned int ColumnCount);
+	CudaSet(queue<string> op_sel, const queue<string> op_sel_as);
     CudaSet(CudaSet* a, CudaSet* b, queue<string> op_sel, queue<string> op_sel_as);    
     ~CudaSet();
     void allocColumnOnDevice(string colname, size_t RecordCount);
@@ -316,7 +583,7 @@ public:
     void resizeDevice(size_t RecCount);
     bool onDevice(string colname);
     CudaSet* copyDeviceStruct();
-    void readSegmentsFromFile(unsigned int segNum, string colname, size_t offset);
+    void readSegmentsFromFile(unsigned int segNum, string colname);
 	int_type readSsdSegmentsFromFile(unsigned int segNum, string colname, size_t offset, thrust::host_vector<unsigned int>& prm_vh, CudaSet* dest);
 	int_type readSsdSegmentsFromFileR(unsigned int segNum, string colname, thrust::host_vector<unsigned int>& prm_vh, thrust::host_vector<unsigned int>& dest);
     void CopyColumnToGpu(string colname,  unsigned int segment, size_t offset = 0);
@@ -339,32 +606,33 @@ public:
     void Store(const string file_name, const char* sep, const unsigned int limit, const bool binary, const bool term = 0);
     void compress_char(const string file_name, const string colname, const size_t mCount, const size_t offset, const unsigned int segment);
 	void compress_int(const string file_name, const string colname, const size_t mCount);
-    bool LoadBigFile(FILE* file_p);
+    bool LoadBigFile(FILE* file_p, thrust::device_vector<char>& d_readbuff, thrust::device_vector<char*>& dest,
+						thrust::device_vector<unsigned int>& ind, thrust::device_vector<unsigned int>& dest_len);
     void free();
     bool* logical_and(bool* column1, bool* column2);
     bool* logical_or(bool* column1, bool* column2);
     bool* compare(int_type s, int_type d, int_type op_type);
     bool* compare(float_type s, float_type d, int_type op_type);
-    bool* compare(int_type* column1, int_type d, int_type op_type);
+    bool* compare(int_type* column1, int_type d, int_type op_type, unsigned int p1, unsigned int p2);
     bool* compare(float_type* column1, float_type d, int_type op_type);
-    bool* compare(int_type* column1, int_type* column2, int_type op_type);
+    bool* compare(int_type* column1, int_type* column2, int_type op_type, unsigned int p1, unsigned int p2);
     bool* compare(float_type* column1, float_type* column2, int_type op_type);
     bool* compare(float_type* column1, int_type* column2, int_type op_type);
-    float_type* op(int_type* column1, float_type* column2, string op_type, int reverse);
-    int_type* op(int_type* column1, int_type* column2, string op_type, int reverse);
-    float_type* op(float_type* column1, float_type* column2, string op_type, int reverse);
-    int_type* op(int_type* column1, int_type d, string op_type, int reverse);
-    float_type* op(int_type* column1, float_type d, string op_type, int reverse);
-    float_type* op(float_type* column1, float_type d, string op_type,int reverse);
+    float_type* op(int_type* column1, float_type* column2, string op_type, bool reverse);
+    int_type* op(int_type* column1, int_type* column2, string op_type, bool reverse, unsigned int p1, unsigned int p2);
+    float_type* op(float_type* column1, float_type* column2, string op_type, bool reverse);
+    int_type* op(int_type* column1, int_type d, string op_type, bool reverse, unsigned int p1, unsigned int p2);
+    float_type* op(int_type* column1, float_type d, string op_type, bool reverse);
+    float_type* op(float_type* column1, float_type d, string op_type, bool reverse);
 	char loadIndex(const string index_name, const unsigned int segment);
 
 protected:
 
     void initialize(queue<string> &nameRef, queue<string> &typeRef, queue<int> &sizeRef, queue<int> &colsRef, size_t Recs, string file_name);
-    void initialize(queue<string> &nameRef, queue<string> &typeRef, queue<int> &sizeRef, queue<int> &colsRef, size_t Recs, queue<string> &references, queue<string> &references_names);
-    void initialize(size_t RecordCount, unsigned int ColumnCount);
+    void initialize(queue<string> &nameRef, queue<string> &typeRef, queue<int> &sizeRef, queue<int> &colsRef, size_t Recs);
+    void initialize(const size_t RecordCount, const unsigned int ColumnCount);
     void initialize(CudaSet* a, CudaSet* b, queue<string> op_sel, queue<string> op_sel_as);
-    void initialize(queue<string> op_sel, queue<string> op_sel_as, queue<string> t_list);
+    void initialize(queue<string> op_sel, const queue<string> op_sel_as);
 };
 
 extern map<string,CudaSet*> varNames; //  STL map to manage CudaSet variables
@@ -373,25 +641,20 @@ void allocColumns(CudaSet* a, queue<string> fields);
 void gatherColumns(CudaSet* a, CudaSet* t, string field, unsigned int segment, size_t& count);
 size_t getSegmentRecCount(CudaSet* a, unsigned int segment);
 void copyColumns(CudaSet* a, queue<string> fields, unsigned int segment, size_t& count, bool rsz = 0, bool flt = 1);
+void copyFinalize(CudaSet* a, queue<string> fields);
 void setPrm(CudaSet* a, CudaSet* b, char val, unsigned int segment);
 void mygather(string colname, CudaSet* a, CudaSet* t, size_t offset, size_t g_size);
 void mycopy(string colname, CudaSet* a, CudaSet* t, size_t offset, size_t g_size);
 size_t load_queue(queue<string> c1, CudaSet* right, string f2, size_t &rcount,
                   unsigned int start_segment, unsigned int end_segment, bool rsz = 1, bool flt = 1);
 size_t max_char(CudaSet* a);
-size_t max_tmp(CudaSet* a);
 void setSegments(CudaSet* a, queue<string> cols);
-size_t max_char(CudaSet* a, set<string> field_names);
 size_t max_char(CudaSet* a, queue<string> field_names);
-size_t maxsz(CudaSet* a);
-void update_permutation_char(char* key, unsigned int* permutation, size_t RecCount, string SortType, char* tmp, unsigned int len);
 void update_permutation_char_host(char* key, unsigned int* permutation, size_t RecCount, string SortType, char* tmp, unsigned int len);
 void apply_permutation_char(char* key, unsigned int* permutation, size_t RecCount, char* tmp, unsigned int len);
 void apply_permutation_char_host(char* key, unsigned int* permutation, size_t RecCount, char* res, unsigned int len);
-size_t load_right(CudaSet* right, string colname, string f2, queue<string> op_g, queue<string> op_sel,
-                  queue<string> op_alt, bool decimal_join, size_t& rcount, unsigned int start_seg, unsigned int end_seg, bool rsz);		
+size_t load_right(CudaSet* right, string f2, queue<string> op_g, queue<string> op_alt, size_t& rcount, unsigned int start_seg, unsigned int end_seg);		
 uint64_t MurmurHash64A ( const void * key, int len, unsigned int seed );
-uint64_t MurmurHash64S ( const void * key, int len, unsigned int seed, unsigned int step, size_t count );
 int_type reverse_op(int_type op_type);
 size_t getFreeMem();
 void delete_records(const char* f);
@@ -405,6 +668,7 @@ bool check_bitmap_file_exist(CudaSet* left, CudaSet* right);
 void check_sort(const string str, const char* rtable, const char* rid);
 void filter_op(const char *s, const char *f, unsigned int segment);
 void update_char_permutation(CudaSet* a, string colname, unsigned int* raw_ptr, string ord, void* temp, bool host);
+void alloc_pool(unsigned int maxRecs);
 
 #endif
 

@@ -28,7 +28,7 @@ void yyerror(char *s, ...);
 #define YY_NO_UNISTD_H
 
 %}
-%option noyywrap nodefault yylineno case-insensitive
+%option noyywrap nodefault yylineno case-insensitive never-interactive
 
 %x COMMENT
 %s BTWMODE
@@ -62,6 +62,8 @@ DISTINCT { return DISTINCT; }
 LEFT { return LEFT; }
 RIGHT { return RIGHT; }
 OUTER { return OUTER; }
+SEMI { return SEMI; }
+ANTI { return ANTI; }
 SORT {return SORT; }
 SEGMENTS {return SEGMENTS; }
 PRESORTED {return PRESORTED; }
@@ -74,7 +76,6 @@ WHEN {return WHEN; }
 THEN {return THEN; }
 ELSE {return ELSE; }
 END {return END; }
-REFERENCES {return REFERENCES; }
 SHOW {return SHOW; }
 TABLES {return TABLES; }
 TABLE {return TABLE; }
@@ -84,13 +85,14 @@ DELETE {return DELETE; }
 FROM {return FROM; }
 LIKE {return LIKE; }
 CREATE {return CREATE; }
-BITMAP {return BITMAP; }
 INDEX {return INDEX; }
+YEAR {return YEAR; }
 
 
 [0-9]+ { yylval.intval = atoll(yytext);  return INTNUM; }
 -?[0-9]+"."[0-9]* |
--?"."[0-9]+ |
+-?[0-9]+"."[0-9]* |
+-?"."[0-9]+ { yylval.strval = strdup(yytext); return DECIMAL1; }
 -?[0-9]+E[-+]?[0-9]+ |
 -?[0-9]+"."[0-9]*E[-+]?[0-9]+ |
 -?"."[0-9]+E[-+]?[0-9]+ { yylval.floatval = atoff(yytext) ;return APPROXNUM; }
@@ -109,21 +111,20 @@ FALSE { yylval.intval = 0; return BOOL1; }
 "||" { return OR; }
 ":=" { return ASSIGN; }
 "=" { return EQUAL; }
+"<>" { return NONEQUAL; }
 "==" { yylval.subtok = 4; return COMPARISON; }
 "<=>" { yylval.subtok = 12; return COMPARISON; }
 ">=" { yylval.subtok = 6; return COMPARISON; }
 ">" { yylval.subtok = 2; return COMPARISON; }
 "<=" { yylval.subtok = 5; return COMPARISON; }
 "<" { yylval.subtok = 1; return COMPARISON; }
-"!=" |
-"<>" { yylval.subtok = 3; return COMPARISON; }
+"!=" { yylval.subtok = 3; return COMPARISON; }
 
 '[A-Za-z0-9_:\\\.|;]*' { yylval.strval = strdup(yytext+1);
 yylval.strval[yyleng-2] = 0; return FILENAME; }
 
 [A-Za-z][A-Za-z0-9_]* { yylval.strval = strdup(yytext);return NAME; }
 '[^'/\\.\n]+' { yylval.strval = strdup(yytext+1);yylval.strval[yyleng-2] = 0; return FILENAME; }
-'[^'\n]*$ { printf("unterminated quoted name %s", yytext); break;}
 
 
 [ \t\n] 
