@@ -53,6 +53,8 @@ void select(queue<string> op_type, queue<string> op_value, queue<int_type> op_nu
     stack<int_type> exe_nums1;
 	stack<unsigned int> exe_precision;
 	stack<unsigned int> exe_precision1;
+	bool ts;
+	stack<bool> exe_ts;
     stack<float_type*> exe_vectors_f;
     stack<float_type> exe_nums_f;
     float_type n1_f, n2_f, res_f;
@@ -416,7 +418,7 @@ void select(queue<string> op_type, queue<string> op_value, queue<int_type> op_nu
                 }
                 else if (ss.compare("NAME") == 0) {
                     exe_value.push(op_value.front());
-					//exe_precision.push(a->decimal_zeroes[op_value.front()]);
+					ts = a->ts_cols[op_value.front()];
                     op_value.pop();					
                 }
             }
@@ -856,6 +858,7 @@ void select(queue<string> op_type, queue<string> op_value, queue<int_type> op_nu
                 col_type.push(1);
 				exe_precision1.push(a->decimal_zeroes[exe_value.top()]);
                 exe_value1.push(exe_value.top());
+				exe_ts.push(ts);				
                 exe_value.pop();												
             };
             if(!exe_vectors.empty()) {  //vector int
@@ -892,7 +895,7 @@ void select(queue<string> op_type, queue<string> op_value, queue<int_type> op_nu
         else if ((grp_type1.top()).compare("COUNTD") == 0 ) {
             b->grp_type[col_val.top()] = 6;
         };
-
+		
 
         if(col_type.top() == 0) {
             // create a vector
@@ -930,12 +933,14 @@ void select(queue<string> op_type, queue<string> op_value, queue<int_type> op_nu
 					
 				if(a->type[exe_value1.top()] == 0) {
 					b->decimal_zeroes[col_val.top()] = exe_precision1.top();
-					exe_precision1.pop();		
+					b->ts_cols[col_val.top()] = exe_ts.top();
 				};
 					
                 if(a->type[exe_value1.top()] == 2 || (a->type[exe_value1.top()] == 0 && a->string_map.find(exe_value1.top()) != a->string_map.end())) {
                     b->string_map[col_val.top()] = a->string_map[exe_value1.top()];
                 };
+				exe_precision1.pop();		
+				exe_ts.pop();					
             }
             else if(a->type[exe_value1.top()] == 1) {
                 //modify what we push there in case of a grouping
@@ -967,6 +972,7 @@ void select(queue<string> op_type, queue<string> op_value, queue<int_type> op_nu
             exe_vectors1.pop();
 			b->decimal_zeroes[col_val.top()] = exe_precision1.top();
 			exe_precision1.pop();		
+			
         }
         else if(col_type.top() == 3) {        //float
 		
